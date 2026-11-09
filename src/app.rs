@@ -94,6 +94,8 @@ struct OsWin {
     scroll_drag: Option<u64>,
     bell_at: Option<Instant>,
     menu: Option<Menu>,
+    /// Dropdown: fullscreen state when it was last hidden (restored on show)
+    was_fullscreen: bool,
     cursor: (f64, f64),
     left_down: bool,
     selecting: Option<u64>,
@@ -148,6 +150,9 @@ pub struct App {
     last_input: Instant,
     discard_session: bool,
     installed_hotkeys: Vec<String>,
+    /// touchpad ctrl+scroll accumulator (pixels)
+    zoom_acc: f64,
+    last_wheel: Option<(Instant, bool)>,
     exiting: bool,
 }
 
@@ -190,6 +195,8 @@ impl App {
             last_input: Instant::now(),
             discard_session: false,
             installed_hotkeys: Vec::new(),
+            zoom_acc: 0.0,
+            last_wheel: None,
             cfg,
             role,
             proxy,
@@ -383,6 +390,7 @@ impl App {
                 scroll_drag: None,
                 bell_at: None,
                 menu: None,
+                was_fullscreen: dropdown && (ws.map(|w| w.fullscreen).unwrap_or(false) || self.cfg.dropdown.start_fullscreen),
                 cursor: (0.0, 0.0),
                 left_down: false,
                 selecting: None,
@@ -820,6 +828,9 @@ impl App {
     }
 
     fn apply_dropdown_geometry(&mut self, el: &ActiveEventLoop, wid: WindowId) {
+        if self.windows.get(&wid).map(|w| w.window.fullscreen().is_some()).unwrap_or(false) {
+            return;
+        }
         let name = self.windows.get(&wid).and_then(|w| w.monitor.clone());
         let Some(mon) = Self::monitor_by_name(el, name.as_deref()).or_else(|| Self::fallback_monitor(el)) else { return };
         let (pos, size) = self.dropdown_geometry(&mon);
@@ -837,7 +848,8 @@ impl App {
         let mon = Self::monitor_by_name(el, name.as_deref()).or_else(|| Self::fallback_monitor(el));
         let target = mon.as_ref().map(|m| self.dropdown_geometry(m));
         let win = self.windows.get_mut(&wid).unwrap();
-        if let (true, Some((pos, size)), Some(m)) = (d.animation, target, mon.as_ref()) {
+        let fullscreen = win.was_fullscreen;
+        if let (true, false, Some((pos, size)), Some(m)) = (d.animation, fullscreen, target, mon.as_ref()) {
             let from = offscreen(&d.animation_from, m, pos, size);
             win.window.set_outer_position(from);
             self.anim = Some(Anim {
@@ -853,12 +865,12 @@ impl App {
         if d.always_on_top {
             win.window.set_window_level(WindowLevel::AlwaysOnTop);
         }
-        if d.start_fullscreen {
+        if fullscreen {
             win.window.set_fullscreen(Some(Fullscreen::Borderless(mon.clone())));
         }
         win.visible = true;
         win.window.request_redraw();
-        if self.anim.is_none() {
+        if self.anim.is_none() && !fullscreen {
             // Some WMs ignore the position while the window is unmapped: re-apply after mapping.
             self.apply_dropdown_geometry(el, wid);
         }
@@ -877,6 +889,16 @@ impl App {
     fn hide_dropdown(&mut self, wid: WindowId) {
         self.pending_hide = None;
         let Some(win) = self.windows.get_mut(&wid) else { return };
+        if win.visible {
+            win.was_fullscreen = win.window.fullscreen().is_some();
+            if win.was_fullscreen {
+                // leave fullscreen before unmapping so the WM restores it cleanly next time
+                win.window.set_fullscreen(None);
+                win.window.set_visible(false);
+                win.visible = false;
+                return;
+            }
+        }
         if self.cfg.dropdown.animation && win.visible && self.anim.is_none() {
             if let (Ok(pos), Some(m)) = (win.window.outer_position(), win.window.current_monitor()) {
                 let size = win.window.outer_size();
@@ -1005,7 +1027,7 @@ impl App {
                 width: Some(if maximized { win.size.0 } else { size.width }),
                 height: Some(if maximized { win.size.1 } else { size.height }),
                 maximized,
-                fullscreen: win.window.fullscreen().is_some(),
+                fullscreen: if win.dropdown && !win.visible { win.was_fullscreen } else { win.window.fullscreen().is_some() },
                 monitor,
                 font_size: Some(win.font_size),
                 active_tab: win.active_tab,
@@ -1859,6 +1881,38 @@ impl App {
     }
 
     fn on_wheel(&mut self, wid: WindowId, delta: MouseScrollDelta) {
+        // Some X setups deliver a wheel click twice (XI2 valuator + legacy button): drop
+        // a same-direction line event arriving within 15 ms.
+        if let MouseScrollDelta::LineDelta(_, y) = delta {
+            let now = Instant::now();
+            if let Some((t, up)) = self.last_wheel {
+                if now - t < Duration::from_millis(15) && up == (y > 0.0) {
+                    return;
+                }
+            }
+            self.last_wheel = Some((now, y > 0.0));
+        }
+        // Ctrl+scroll: font size of this window
+        if self.modifiers.control_key() {
+            let steps = match delta {
+                MouseScrollDelta::LineDelta(_, y) => {
+                    self.zoom_acc = 0.0;
+                    if y > 0.0 { 1 } else if y < 0.0 { -1 } else { 0 }
+                }
+                MouseScrollDelta::PixelDelta(p) => {
+                    self.zoom_acc += p.y;
+                    let n = (self.zoom_acc / 40.0).trunc();
+                    self.zoom_acc -= n * 40.0;
+                    n as i32
+                }
+            };
+            if steps != 0 {
+                let size = (self.windows[&wid].font_size + steps as f32).clamp(4.0, 72.0);
+                self.set_font_size(wid, size);
+                self.toast(wid, format!("Font size {size}pt  (Ctrl+Shift+Backspace: reset)"));
+            }
+            return;
+        }
         let win = &self.windows[&wid];
         let lines = match delta {
             MouseScrollDelta::LineDelta(_, y) => (y * 3.0) as i32,

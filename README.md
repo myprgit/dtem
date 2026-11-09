@@ -81,7 +81,7 @@ Typed inside a dtem terminal, it runs ssh **right in that pane** (like `kitten s
 - The dropdown always appears on the monitor you last moved it to. To move it, either:
   - use `kitty_mod+alt+m` (next monitor), or
   - use GNOME's `Super+Shift+←/→`.
-- The chosen monitor is stored in the session, so it survives reboot. If that monitor is unplugged, the dropdown falls back to the primary monitor.
+- The chosen monitor, and whether the dropdown was fullscreen when last hidden, are stored in the session, so they survive reboot. If that monitor is unplugged, the dropdown falls back to the primary monitor.
 - When the hotkey is pressed while the dropdown is visible but unfocused, it is focused. If it is already focused, it is hidden.
 
 ## Wayland
@@ -112,7 +112,7 @@ Typed inside a dtem terminal, it runs ssh **right in that pane** (like `kitten s
 | open URL | `ctrl+click` |
 | scroll | `kitty_mod+↑/↓/k/j`, `shift+pgup/pgdn`, `kitty_mod+home/end` |
 | clear scrollback | `kitty_mod+delete` |
-| font size | `kitty_mod+=` / `kitty_mod+-` / `kitty_mod+backspace` |
+| font size | `kitty_mod+=` / `kitty_mod+-` / `kitty_mod+backspace`, or **Ctrl+mouse wheel** |
 | new OS window | `kitty_mod+n` |
 | fullscreen | `kitty_mod+f11` |
 | export layout to `~/.config/dtem/sessions/` | `kitty_mod+alt+s` |
