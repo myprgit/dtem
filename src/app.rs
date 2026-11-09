@@ -4,11 +4,12 @@ use crate::font::{self, FontSet};
 use crate::keys::{self, Action, Bindings};
 use crate::layout::{self, Dir, Node, Rect};
 use crate::pane::{Pane, SpawnOpts};
+use crate::remote::{self, Remote};
 use crate::renderer::{rgba, Gpu, Renderer};
 use crate::session::{self, SNode, Session, TabState, WinState};
 use crate::UserEvent;
 use alacritty_terminal::event::{Event as TermEvent, WindowSize};
-use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
 use alacritty_terminal::term::cell::Flags;
@@ -48,6 +49,7 @@ pub struct Startup {
     pub restore: bool,
     pub session_file: Option<PathBuf>,
     pub show_dropdown: bool,
+    pub remote: Option<Vec<String>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -55,6 +57,8 @@ enum Confirm {
     Tab(usize),
     Pane(u64),
     Window,
+    /// A program asked to read the clipboard (OSC 52)
+    ClipRead(u64),
 }
 
 struct Tab {
@@ -76,6 +80,12 @@ struct OsWin {
     scale: f64,
     rename: Option<String>,
     confirm: Option<Confirm>,
+    preedit: Option<String>,
+    toast: Option<(String, Instant)>,
+    /// (pane, grid line, first col, last col, url) under the mouse while ctrl is held
+    hover_url: Option<(u64, i32, usize, usize, String)>,
+    pointer_cursor: bool,
+    ime_area: Option<(i32, i32)>,
     cursor: (f64, f64),
     left_down: bool,
     selecting: Option<u64>,
@@ -114,6 +124,13 @@ pub struct App {
     last_session_json: String,
     hotkey: Option<global_hotkey::GlobalHotKeyManager>,
     focus_try: Option<Instant>,
+    /// arboard: images and file lists
+    rich_clip: Option<arboard::Clipboard>,
+    clip_read_always: bool,
+    pending_clip: HashMap<WindowId, Arc<dyn Fn(&str) -> String + Send + Sync>>,
+    helpers_done: std::collections::HashSet<String>,
+    last_focused: Option<WindowId>,
+    url_re: regex::Regex,
     exiting: bool,
 }
 
@@ -163,6 +180,12 @@ impl App {
             last_session_json: String::new(),
             hotkey: None,
             focus_try: None,
+            rich_clip: None,
+            clip_read_always: false,
+            pending_clip: HashMap::new(),
+            helpers_done: Default::default(),
+            last_focused: None,
+            url_re: regex::Regex::new(r#"(?:https?|ftp|file)://[^\s<>"'`{}|\\^]+|www\.[^\s<>"'`{}|\\^]+"#).unwrap(),
             exiting: false,
         })
     }
@@ -243,6 +266,9 @@ impl App {
                 attrs = attrs.with_maximized(true);
             }
         }
+        if self.cfg.background_opacity < 1.0 {
+            attrs = attrs.with_transparent(true);
+        }
         let window = match el.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {
@@ -250,6 +276,8 @@ impl App {
                 return None;
             }
         };
+        window.set_ime_allowed(self.cfg.ime);
+        window.set_cursor(winit::window::CursorIcon::Text);
         if !dropdown && ws.map(|w| w.fullscreen).unwrap_or(false) {
             window.set_fullscreen(Some(Fullscreen::Borderless(None)));
         }
@@ -282,7 +310,14 @@ impl App {
         let font_size = ws.and_then(|w| w.font_size).unwrap_or(self.cfg.font_size);
         let metrics = font::cell_metrics(&self.fonts, pt_to_px(font_size, scale), self.cfg.line_height);
         let size = window.inner_size();
-        let renderer = Renderer::new(self.gpu.as_ref().unwrap(), surface, size.width, size.height, metrics);
+        let renderer = Renderer::new(
+            self.gpu.as_ref().unwrap(),
+            surface,
+            size.width,
+            size.height,
+            metrics,
+            self.cfg.background_opacity,
+        );
         let id = window.id();
         let pos = window.outer_position().ok().map(|p| (p.x, p.y));
         self.windows.insert(
@@ -299,6 +334,11 @@ impl App {
                 scale,
                 rename: None,
                 confirm: None,
+                preedit: None,
+                toast: None,
+                hover_url: None,
+                pointer_cursor: false,
+                ime_area: None,
                 cursor: (0.0, 0.0),
                 left_down: false,
                 selecting: None,
@@ -403,8 +443,16 @@ impl App {
         let mut specs: Vec<(u64, SpawnOpts)> = Vec::new();
         fn build(app: &mut App, n: &SNode, specs: &mut Vec<(u64, SpawnOpts)>, restore: bool) -> Node {
             match n {
-                SNode::Leaf { cwd, command, scrollback, title } => {
+                SNode::Leaf { cwd, command, scrollback, title, remote } => {
                     let id = app.alloc_id();
+                    let remote = remote.clone().map(Remote::new_multiplexed);
+                    let program = remote.as_ref().map(|r| {
+                        // restored remote panes ask before reconnecting (programs aren't restarted)
+                        ("/bin/sh".to_string(), vec!["-c".to_string(), r.pane_script(restore)])
+                    });
+                    if let Some(r) = &remote {
+                        app.ensure_remote_helpers(r);
+                    }
                     let restore_bytes = if restore && app.cfg.persist_scrollback {
                         scrollback.as_ref().and_then(|s| session::read_scrollback(app.role.name(), s))
                     } else {
@@ -418,6 +466,8 @@ impl App {
                             restore: restore_bytes,
                             persist_id: if restore { scrollback.clone() } else { None },
                             title: title.clone(),
+                            program,
+                            remote,
                         },
                     ));
                     Node::Leaf(id)
@@ -454,7 +504,13 @@ impl App {
         let ts = TabState {
             title: None,
             active: 0,
-            layout: SNode::Leaf { cwd: cwd.map(|p| p.display().to_string()), command: None, scrollback: None, title: None },
+            layout: SNode::Leaf {
+                cwd: cwd.map(|p| p.display().to_string()),
+                command: None,
+                scrollback: None,
+                title: None,
+                remote: None,
+            },
         };
         self.add_tab_from_state(wid, &ts, false, at);
     }
@@ -486,7 +542,8 @@ impl App {
         }
         self.relayout(wid);
         let r = self.windows[&wid].pane_rects.iter().find(|(i, _)| *i == id).map(|x| x.1).unwrap_or_default();
-        let opts = SpawnOpts { cwd, command: None, restore: None, persist_id: None, title: None };
+        let opts =
+            SpawnOpts { cwd, command: None, restore: None, persist_id: None, title: None, program: None, remote: None };
         if !self.spawn_pane(wid, id, opts, r) {
             self.remove_leaf(wid, id);
         }
@@ -600,6 +657,7 @@ impl App {
             Confirm::Tab(_) => cc.tab,
             Confirm::Pane(_) => cc.pane,
             Confirm::Window => cc.window,
+            Confirm::ClipRead(_) => true,
         };
         if !ask {
             self.execute_close(el, wid, c);
@@ -616,6 +674,14 @@ impl App {
         match c {
             Confirm::Tab(i) => self.close_tab(el, wid, i),
             Confirm::Pane(id) => self.close_pane(el, id),
+            Confirm::ClipRead(id) => {
+                if let Some(f) = self.pending_clip.remove(&wid) {
+                    let text = self.clip_get(false);
+                    if let Some(p) = self.panes.get(&id) {
+                        p.write(f(&text).into_bytes());
+                    }
+                }
+            }
             Confirm::Window => {
                 let normal_windows = self.windows.values().filter(|w| !w.dropdown).count();
                 if normal_windows == 1 && self.role == Role::Main {
@@ -642,6 +708,10 @@ impl App {
                 }
             }
             Confirm::Pane(_) => "Close this pane?".to_string(),
+            Confirm::ClipRead(id) => {
+                let who = self.panes.get(&id).and_then(|p| p.remote.as_ref().map(|r| r.label())).unwrap_or("A program".into());
+                format!("{who} wants to read your clipboard.")
+            }
             Confirm::Window => {
                 let tabs = win.tabs.len();
                 let panes: usize = win.tabs.iter().map(|t| t.root.leaf_list().len()).sum();
@@ -773,11 +843,15 @@ impl App {
     fn snode(&mut self, n: &Node) -> SNode {
         match n {
             Node::Leaf(id) => {
-                let (cwd, sb) = match self.panes.get_mut(id) {
-                    Some(p) => (p.cwd().map(|c| c.display().to_string()), Some(p.persist_id.clone())),
-                    None => (None, None),
+                let (cwd, sb, remote) = match self.panes.get_mut(id) {
+                    Some(p) => (
+                        p.cwd().map(|c| c.display().to_string()),
+                        Some(p.persist_id.clone()),
+                        p.remote.as_ref().map(|r| r.args.clone()),
+                    ),
+                    None => (None, None, None),
                 };
-                SNode::Leaf { cwd, command: None, scrollback: sb, title: None }
+                SNode::Leaf { cwd, command: None, scrollback: sb, title: None, remote }
             }
             Node::Split { vertical, ratio, a, b } => SNode::Split {
                 vertical: *vertical,
@@ -892,20 +966,13 @@ impl App {
     }
 
     fn paste(&mut self, wid: WindowId, primary: bool) {
-        let text = self.clip_get(primary);
         let Some(id) = self.active_pane_id(wid) else { return };
-        let Some(p) = self.panes.get(&id) else { return };
-        if text.is_empty() {
+        // Files / images on the clipboard: upload to ssh panes, or insert local paths.
+        if !primary && self.paste_rich(wid, id) {
             return;
         }
-        let bracketed = p.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
-        if bracketed {
-            let clean = text.replace('\x1b', "");
-            p.write(format!("\x1b[200~{clean}\x1b[201~").into_bytes());
-        } else {
-            p.write(text.replace("\r\n", "\r").replace('\n', "\r").into_bytes());
-        }
-        p.term.lock().scroll_display(Scroll::Bottom);
+        let text = self.clip_get(primary);
+        self.paste_into(id, &text);
     }
 
     // ------------------------------------------------------------------ actions
@@ -1136,15 +1203,33 @@ impl App {
 
     fn on_key(&mut self, el: &ActiveEventLoop, wid: WindowId, ev: KeyEvent) {
         if ev.state != ElementState::Pressed {
+            // Key releases only matter for apps using the kitty keyboard protocol.
+            if let Some(p) = self.active_pane_id(wid).and_then(|id| self.panes.get(&id)) {
+                let mode = *p.term.lock().mode();
+                if mode.contains(TermMode::REPORT_EVENT_TYPES) {
+                    if let Some(b) = keys::encode_kitty(&ev, self.modifiers, mode, 3) {
+                        p.write(b);
+                    }
+                }
+            }
             return;
+        }
+        if self.windows.get(&wid).map(|w| w.preedit.is_some()).unwrap_or(false) {
+            return; // input method is composing
         }
         // Close confirmation prompt
         if let Some(c) = self.windows.get(&wid).and_then(|w| w.confirm) {
-            let yes = match &ev.logical_key {
-                Key::Named(NamedKey::Enter) => true,
-                Key::Character(s) => matches!(s.as_str(), "y" | "Y" | "e" | "E"),
-                _ => false,
-            };
+            let always = matches!(&ev.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("a"))
+                && matches!(c, Confirm::ClipRead(_));
+            let yes = always
+                || match &ev.logical_key {
+                    Key::Named(NamedKey::Enter) => true,
+                    Key::Character(s) => matches!(s.as_str(), "y" | "Y" | "e" | "E"),
+                    _ => false,
+                };
+            if always {
+                self.clip_read_always = true;
+            }
             let modifier_only = matches!(
                 &ev.logical_key,
                 Key::Named(NamedKey::Shift | NamedKey::Control | NamedKey::Alt | NamedKey::Super)
@@ -1155,6 +1240,8 @@ impl App {
             self.windows.get_mut(&wid).unwrap().confirm = None;
             if yes {
                 self.execute_close(el, wid, c);
+            } else {
+                self.pending_clip.remove(&wid);
             }
             if let Some(w) = self.windows.get(&wid) {
                 w.window.request_redraw();
@@ -1193,7 +1280,12 @@ impl App {
         let Some(id) = self.active_pane_id(wid) else { return };
         let Some(p) = self.panes.get(&id) else { return };
         let mode = *p.term.lock().mode();
-        if let Some(bytes) = keys::encode(&ev, self.modifiers, mode) {
+        let bytes = if mode.intersects(TermMode::KITTY_KEYBOARD_PROTOCOL) {
+            keys::encode_kitty(&ev, self.modifiers, mode, if ev.repeat { 2 } else { 1 })
+        } else {
+            keys::encode(&ev, self.modifiers, mode)
+        };
+        if let Some(bytes) = bytes {
             {
                 let mut t = p.term.lock();
                 t.scroll_display(Scroll::Bottom);
@@ -1289,6 +1381,14 @@ impl App {
         }
         let (point, side, col, row) = self.cell_at(wid, id, rect, x, y);
 
+        // Ctrl+click opens URLs / OSC 8 hyperlinks
+        if pressed && button == MouseButton::Left && self.modifiers.control_key() {
+            if let Some((_, _, url)) = self.url_at(id, point) {
+                self.open_url(&url);
+                return;
+            }
+        }
+
         // Mouse reporting to applications (vim, htop, ...)
         let reporting = self.windows[&wid].reporting_button;
         if (pressed || reporting == Some(btn)) && self.mouse_report(id, btn, pressed, false, col, row) {
@@ -1350,8 +1450,9 @@ impl App {
     }
 
     fn on_cursor_moved(&mut self, wid: WindowId, x: f64, y: f64) {
+        self.windows.get_mut(&wid).unwrap().cursor = (x, y);
+        self.update_hover(wid);
         let win = self.windows.get_mut(&wid).unwrap();
-        win.cursor = (x, y);
         let reporting = win.reporting_button;
         let selecting = if win.left_down { win.selecting } else { None };
         if let Some(b) = reporting {
@@ -1416,7 +1517,14 @@ impl App {
     // ------------------------------------------------------------------ rendering
 
     fn render(&mut self, wid: WindowId) {
-        let confirm_text = self.windows.get(&wid).and_then(|w| w.confirm).map(|c| self.confirm_text(wid, c));
+        let confirm_text = self.windows.get(&wid).and_then(|w| w.confirm).map(|c| {
+            let hint = if matches!(c, Confirm::ClipRead(_)) {
+                "[y] allow once   [a] always   [n] deny"
+            } else {
+                "[y/Enter] yes   [n/Esc] no"
+            };
+            format!("{}   {hint}", self.confirm_text(wid, c))
+        });
         let App { windows, panes, fonts, gpu, theme, cfg, .. } = self;
         let Some(gpu) = gpu.as_ref() else { return };
         let Some(win) = windows.get_mut(&wid) else { return };
@@ -1445,10 +1553,14 @@ impl App {
             }
         }
 
+        let mut cursor_px: Option<(f32, f32)> = None;
         for (id, r) in &rects {
             let Some(pane) = panes.get(id) else { continue };
             let is_active = Some(*id) == active_pane;
-            win.renderer.rect(r.x, r.y, r.w, r.h, rgba(bg_default, 1.0));
+            if win.renderer.opacity >= 1.0 {
+                win.renderer.rect(r.x, r.y, r.w, r.h, rgba(bg_default, 1.0));
+            }
+            let hover = win.hover_url.as_ref().filter(|h| h.0 == *id).map(|h| (h.1, h.2, h.3));
             let term = pane.term.lock();
             let content = term.renderable_content();
             let colors = content.colors;
@@ -1457,6 +1569,8 @@ impl App {
             let cursor = content.cursor;
             let ox = r.x + pad;
             let oy = r.y + pad;
+            let mut row_buf: Vec<RCell> = Vec::with_capacity(pane.cols);
+            let mut cur_row = i32::MIN;
             for ind in content.display_iter {
                 let cell = ind.cell;
                 if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
@@ -1464,6 +1578,11 @@ impl App {
                 }
                 let row = ind.point.line.0 + offset;
                 let col = ind.point.column.0;
+                if row != cur_row {
+                    draw_row(&mut win.renderer, gpu, fonts, &row_buf, ox, oy + cur_row as f32 * m.height, cfg.ligatures);
+                    row_buf.clear();
+                    cur_row = row;
+                }
                 let x = ox + col as f32 * m.width;
                 let y = oy + row as f32 * m.height;
                 let mut fg = resolve(cell.fg, colors, theme);
@@ -1496,19 +1615,26 @@ impl App {
                     style |= font::ITALIC;
                 }
                 let fgc = rgba(fg, 1.0);
-                win.renderer.glyph(gpu, fonts, cell.c, style, x, y, fgc);
-                if let Some(zw) = cell.zerowidth() {
-                    for c in zw {
-                        win.renderer.glyph(gpu, fonts, *c, style, x, y, fgc);
-                    }
-                }
-                if cell.flags.intersects(Flags::ALL_UNDERLINES) {
+                let wide = cell.flags.contains(Flags::WIDE_CHAR);
+                row_buf.push(RCell {
+                    col,
+                    c: cell.c,
+                    fg: fgc,
+                    style,
+                    wide,
+                    zw: cell.zerowidth().map(|z| z.to_vec()).unwrap_or_default(),
+                });
+                let hovered = hover
+                    .map(|(l, a, b)| l == ind.point.line.0 && (a..=b).contains(&col))
+                    .unwrap_or(false);
+                if cell.flags.intersects(Flags::ALL_UNDERLINES) || hovered {
                     win.renderer.rect_top(x, y + m.underline_pos, cw, m.thickness, fgc);
                 }
                 if cell.flags.contains(Flags::STRIKEOUT) {
                     win.renderer.rect_top(x, y + (m.height / 2.0).round(), cw, m.thickness, fgc);
                 }
             }
+            draw_row(&mut win.renderer, gpu, fonts, &row_buf, ox, oy + cur_row as f32 * m.height, cfg.ligatures);
             // Cursor
             let crow = cursor.point.line.0 + offset;
             if cursor.shape != CursorShape::Hidden && crow >= 0 && (crow as usize) < pane.rows {
@@ -1517,6 +1643,9 @@ impl App {
                 let cell = &term.grid()[cursor.point];
                 let cw = if cell.flags.contains(Flags::WIDE_CHAR) { m.width * 2.0 } else { m.width };
                 let cc = rgba(colors[NamedColor::Cursor].map(to_rgb).unwrap_or(theme.table[258]), 1.0);
+                if is_active {
+                    cursor_px = Some((x, y));
+                }
                 let focused = win.focused && is_active;
                 let shape = if !focused {
                     CursorShape::HollowBlock
@@ -1537,7 +1666,8 @@ impl App {
                         if cell.flags.contains(Flags::BOLD) {
                             style |= font::BOLD;
                         }
-                        win.renderer.glyph(gpu, fonts, cell.c, style, x, y, rgba(theme.cursor_text, 1.0));
+                        let cells = if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
+                        win.renderer.glyph(gpu, fonts, cell.c, style, cells, x, y, rgba(theme.cursor_text, 1.0));
                     }
                     CursorShape::Beam => win.renderer.rect_top(x, y, (t * 2.0).max(2.0), m.height, cc),
                     CursorShape::Underline => win.renderer.rect_top(x, y + m.height - t * 2.0, cw, t * 2.0, cc),
@@ -1548,6 +1678,24 @@ impl App {
                         win.renderer.rect_top(x + cw - t, y, t, m.height, cc);
                     }
                 }
+            }
+        }
+
+        // IME: position the candidate window and draw the preedit text at the cursor
+        if let Some((cx, cy)) = cursor_px {
+            let area = (cx as i32, cy as i32);
+            if win.ime_area != Some(area) {
+                win.ime_area = Some(area);
+                win.window.set_ime_cursor_area(
+                    PhysicalPosition::new(cx as f64, cy as f64),
+                    PhysicalSize::new(m.width as f64, m.height as f64),
+                );
+            }
+            if let Some(pre) = win.preedit.clone() {
+                let w = pre.chars().map(|c| if c.len_utf8() > 2 { 2.0 } else { 1.0 }).sum::<f32>() * m.width;
+                win.renderer.rect_top(cx, cy, w, m.height, rgba(theme.table[257], 1.0));
+                win.renderer.text(gpu, fonts, &pre, cx, cy, w + m.width, rgba(theme.table[256], 1.0));
+                win.renderer.rect_top(cx, cy + m.height - m.thickness, w, m.thickness, rgba(theme.table[256], 1.0));
             }
         }
 
@@ -1605,7 +1753,7 @@ impl App {
         // Close confirmation overlay
         if let Some(text) = confirm_text {
             let (_, wh) = win.renderer.size();
-            let line = format!("{text}   [y/Enter] yes   [n/Esc] no");
+            let line = text;
             let tw = (line.chars().count() as f32 + 4.0) * m.width;
             let bw = tw.min(ww);
             let bh = m.height * 3.0;
@@ -1614,6 +1762,19 @@ impl App {
             win.renderer.rect_top(bx - 2.0, by - 2.0, bw + 4.0, bh + 4.0, rgba(theme.active_border, 1.0));
             win.renderer.rect_top(bx, by, bw, bh, rgba(theme.tab_bar_bg, 1.0));
             win.renderer.text(gpu, fonts, &line, bx + 2.0 * m.width, by + m.height, bw - 2.0 * m.width, rgba(theme.table[256], 1.0));
+        }
+        // Toast (bottom right)
+        if let Some((msg, t)) = win.toast.clone() {
+            if t.elapsed() < Duration::from_secs(4) {
+                let (_, wh) = win.renderer.size();
+                let tw = ((msg.chars().count() as f32 + 2.0) * m.width).min(ww - 8.0);
+                let (bx, by) = (ww - tw - 8.0, wh - m.height * 2.0 - 8.0);
+                win.renderer.rect_top(bx - 1.0, by - 1.0, tw + 2.0, m.height * 2.0 + 2.0, rgba(theme.active_border, 1.0));
+                win.renderer.rect_top(bx, by, tw, m.height * 2.0, rgba(theme.tab_bar_bg, 1.0));
+                win.renderer.text(gpu, fonts, &msg, bx + m.width, by + m.height / 2.0, tw - m.width, rgba(theme.table[256], 1.0));
+            } else {
+                win.toast = None;
+            }
         }
         win.renderer.present(gpu, bg_default);
     }
@@ -1650,14 +1811,34 @@ impl App {
                 }
             }
             TermEvent::ClipboardStore(ty, s) => {
+                if let Some(path) = s.strip_prefix("dtem-file:") {
+                    // `dtem-copy FILE` on a remote host
+                    self.fetch_remote_file(id, path.trim().to_string());
+                    return;
+                }
                 let primary = matches!(ty, alacritty_terminal::term::ClipboardType::Selection);
+                let n = s.chars().count();
                 self.clip_set(primary, s);
+                if !primary && self.panes.get(&id).map(|p| p.remote.is_some()).unwrap_or(false) {
+                    self.toast_pane(id, format!("Copied {n} chars from remote"));
+                }
             }
             TermEvent::ClipboardLoad(ty, f) => {
                 let primary = matches!(ty, alacritty_terminal::term::ClipboardType::Selection);
-                let text = self.clip_get(primary);
-                if let Some(p) = self.panes.get(&id) {
-                    p.write(f(&text).into_bytes());
+                let policy = self.cfg.clipboard_read.clone();
+                if policy == "allow" || self.clip_read_always {
+                    let text = self.clip_get(primary);
+                    if let Some(p) = self.panes.get(&id) {
+                        p.write(f(&text).into_bytes());
+                    }
+                } else if policy == "ask" {
+                    if let Some(w) = wid {
+                        self.pending_clip.insert(w, f);
+                        if let Some(win) = self.windows.get_mut(&w) {
+                            win.confirm = Some(Confirm::ClipRead(id));
+                            win.window.request_redraw();
+                        }
+                    }
                 }
             }
             TermEvent::ColorRequest(idx, f) => {
@@ -1709,6 +1890,9 @@ impl App {
         }
         if let Some(f) = &st.session_file {
             self.open_session_file(el, f);
+        }
+        if let Some(args) = st.remote.clone() {
+            self.open_remote(el, args);
         }
         match self.role {
             Role::Main => {
@@ -1774,6 +1958,62 @@ impl App {
     }
 }
 
+/// One visible cell of a row, waiting to be drawn.
+struct RCell {
+    col: usize,
+    c: char,
+    fg: [f32; 4],
+    style: u8,
+    wide: bool,
+    zw: Vec<char>,
+}
+
+/// Draw a row's text. Runs of same-style/same-colour cells are shaped together so the
+/// font's ligatures and contextual alternates apply.
+#[allow(clippy::too_many_arguments)]
+fn draw_row(r: &mut Renderer, gpu: &Gpu, fonts: &mut FontSet, cells: &[RCell], ox: f32, y: f32, ligatures: bool) {
+    let m = r.metrics;
+    let mut i = 0;
+    while i < cells.len() {
+        let c = &cells[i];
+        let face = fonts.style_face(c.style);
+        let shapeable = |x: &RCell| {
+            !x.wide && x.zw.is_empty() && x.c != ' ' && x.c != '\0' && x.c.is_ascii_graphic()
+        };
+        if ligatures && shapeable(c) && fonts.face(face).glyph(c.c) != 0 {
+            // extend the run
+            let mut j = i + 1;
+            while j < cells.len() {
+                let n = &cells[j];
+                if !shapeable(n) || n.style != c.style || n.fg != c.fg || n.col != cells[j - 1].col + 1 {
+                    break;
+                }
+                j += 1;
+            }
+            let x0 = ox + c.col as f32 * m.width;
+            if j - i == 1 {
+                let gid = fonts.face(face).glyph(c.c);
+                r.glyph_id(gpu, fonts, face, gid, 1, x0, y, c.fg);
+            } else {
+                let text: String = cells[i..j].iter().map(|x| x.c).collect();
+                let shaped = fonts.shape(face, &text);
+                for (gid, cell) in shaped.iter() {
+                    r.glyph_id(gpu, fonts, face, *gid, 1, x0 + *cell as f32 * m.width, y, c.fg);
+                }
+            }
+            i = j;
+            continue;
+        }
+        let x = ox + c.col as f32 * m.width;
+        let cells_w = if c.wide { 2 } else { 1 };
+        r.glyph(gpu, fonts, c.c, c.style, cells_w, x, y, c.fg);
+        for z in &c.zw {
+            r.glyph(gpu, fonts, *z, c.style, cells_w, x, y, c.fg);
+        }
+        i += 1;
+    }
+}
+
 fn expand_tilde(s: &str) -> PathBuf {
     if let Some(rest) = s.strip_prefix("~") {
         if let Some(h) = dirs::home_dir() {
@@ -1812,6 +2052,14 @@ impl ApplicationHandler<UserEvent> for App {
         }
         match ev {
             UserEvent::Term(id, e) => self.handle_term_event(el, id, e),
+            UserEvent::InsertText(pane, text) => self.paste_into(pane, &text),
+            UserEvent::Toast(pane, msg) => self.toast_pane(pane, msg),
+            UserEvent::RemoteFile(pane, name, data) => self.on_remote_file(pane, name, data),
+            UserEvent::Redraw(w) => {
+                if let Some(w) = self.windows.get(&w) {
+                    w.window.request_redraw();
+                }
+            }
             UserEvent::Signal => {
                 self.save_session(true);
                 self.exiting = true;
@@ -1840,6 +2088,10 @@ impl ApplicationHandler<UserEvent> for App {
                     _ => {
                         if let Some(p) = c.strip_prefix("session ") {
                             self.open_session_file(el, std::path::Path::new(p));
+                        } else if let Some(j) = c.strip_prefix("remote ") {
+                            if let Ok(args) = serde_json::from_str::<Vec<String>>(j) {
+                                self.open_remote(el, args);
+                            }
                         }
                     }
                 }
@@ -1893,6 +2145,9 @@ impl ApplicationHandler<UserEvent> for App {
                 self.set_font_size(wid, fs);
             }
             WindowEvent::Focused(f) => {
+                if f {
+                    self.last_focused = Some(wid);
+                }
                 let win = self.windows.get_mut(&wid).unwrap();
                 win.focused = f;
                 win.window.request_redraw();
@@ -1908,7 +2163,38 @@ impl ApplicationHandler<UserEvent> for App {
                     self.hide_dropdown(wid);
                 }
             }
-            WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
+            WindowEvent::ModifiersChanged(m) => {
+                self.modifiers = m.state();
+                self.update_hover(wid);
+            }
+            WindowEvent::Ime(ime) => {
+                use winit::event::Ime;
+                let win = self.windows.get_mut(&wid).unwrap();
+                match ime {
+                    Ime::Preedit(text, _) => {
+                        win.preedit = if text.is_empty() { None } else { Some(text) };
+                        win.window.request_redraw();
+                    }
+                    Ime::Commit(text) => {
+                        win.preedit = None;
+                        win.window.request_redraw();
+                        if let Some(p) = self.active_pane_id(wid).and_then(|id| self.panes.get(&id)) {
+                            p.term.lock().scroll_display(Scroll::Bottom);
+                            p.write(text.into_bytes());
+                        }
+                    }
+                    Ime::Enabled | Ime::Disabled => {
+                        win.preedit = None;
+                    }
+                }
+            }
+            WindowEvent::DroppedFile(path) => {
+                let (x, y) = self.windows[&wid].cursor;
+                let target = self.pane_at(wid, x, y).map(|(id, _)| id).or(self.active_pane_id(wid));
+                if let Some(id) = target {
+                    self.send_paths(wid, id, vec![path]);
+                }
+            }
             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } => self.on_key(el, wid, event),
             WindowEvent::CursorMoved { position, .. } => self.on_cursor_moved(wid, position.x, position.y),
             WindowEvent::MouseInput { state, button, .. } => self.on_mouse_button(el, wid, state, button),
@@ -1934,4 +2220,355 @@ impl ApplicationHandler<UserEvent> for App {
             self.save_session(true);
         }
     }
+}
+
+// ---------------------------------------------------------------------- remote, clipboard, URLs
+impl App {
+    fn toast(&mut self, wid: WindowId, msg: impl Into<String>) {
+        if let Some(w) = self.windows.get_mut(&wid) {
+            w.toast = Some((msg.into(), Instant::now()));
+            w.window.request_redraw();
+            let proxy = self.proxy.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(4100));
+                let _ = proxy.send_event(UserEvent::Redraw(wid));
+            });
+        }
+    }
+
+    fn toast_pane(&mut self, pane: u64, msg: impl Into<String>) {
+        if let Some(w) = self.pane_win.get(&pane).copied() {
+            self.toast(w, msg);
+        }
+    }
+
+    /// Install `dtem-copy` on the remote once the multiplexed connection is up (once per host).
+    fn ensure_remote_helpers(&mut self, r: &Remote) {
+        if !self.cfg.remote_install_helpers || !self.helpers_done.insert(r.label()) {
+            return;
+        }
+        let r = r.clone();
+        std::thread::spawn(move || {
+            for _ in 0..600 {
+                if r.is_connected() {
+                    match r.install_helpers() {
+                        Ok(_) => log::info!("installed dtem-copy on {}", r.label()),
+                        Err(e) => log::warn!("cannot install dtem-copy on {}: {e}", r.label()),
+                    }
+                    return;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        });
+    }
+
+    /// Open `ssh <args>` in a new tab of the most recently focused window.
+    fn open_remote(&mut self, el: &ActiveEventLoop, args: Vec<String>) {
+        if remote::split_ssh_args(&args).is_none() {
+            log::error!("--remote: no destination given");
+            return;
+        }
+        let wid = self
+            .last_focused
+            .filter(|w| self.windows.get(w).map(|w| !w.dropdown || self.role == Role::Dropdown).unwrap_or(false))
+            .or_else(|| self.order.iter().copied().find(|w| !self.windows[w].dropdown || self.role == Role::Dropdown));
+        let wid = match wid {
+            Some(w) => w,
+            None => match self.create_window(el, None, self.role == Role::Dropdown) {
+                Some(w) => w,
+                None => return,
+            },
+        };
+        let at = self.windows.get(&wid).map(|w| if w.tabs.is_empty() { 0 } else { w.active_tab + 1 });
+        let ts = TabState {
+            title: None,
+            active: 0,
+            layout: SNode::Leaf { cwd: None, command: None, scrollback: None, title: None, remote: Some(args) },
+        };
+        self.add_tab_from_state(wid, &ts, false, at);
+        let w = &self.windows[&wid];
+        if w.dropdown && !w.visible {
+            self.show_dropdown(el, wid);
+        } else {
+            w.window.focus_window();
+        }
+        self.mark_save_soon();
+    }
+
+    fn rich_clip(&mut self) -> Option<&mut arboard::Clipboard> {
+        if self.rich_clip.is_none() {
+            self.rich_clip = arboard::Clipboard::new().map_err(|e| log::warn!("clipboard: {e}")).ok();
+        }
+        self.rich_clip.as_mut()
+    }
+
+    /// Paste text into a pane (bracketed paste aware).
+    fn paste_into(&self, pane: u64, text: &str) {
+        let Some(p) = self.panes.get(&pane) else { return };
+        if text.is_empty() {
+            return;
+        }
+        let bracketed = p.term.lock().mode().contains(TermMode::BRACKETED_PASTE);
+        if bracketed {
+            let clean = text.replace('\x1b', "");
+            p.write(format!("\x1b[200~{clean}\x1b[201~").into_bytes());
+        } else {
+            p.write(text.replace("\r\n", "\r").replace('\n', "\r").into_bytes());
+        }
+        let mut t = p.term.lock();
+        t.scroll_display(Scroll::Bottom);
+        t.selection = None;
+    }
+
+    /// Clipboard contains files or an image (no text)? Send them to the pane:
+    /// uploaded to the remote for ssh panes, or as local paths.
+    fn paste_rich(&mut self, wid: WindowId, pane: u64) -> bool {
+        let files: Vec<PathBuf> = self
+            .rich_clip()
+            .and_then(|c| c.get().file_list().ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.is_file())
+            .collect();
+        if !files.is_empty() {
+            self.send_paths(wid, pane, files);
+            return true;
+        }
+        if !self.clip_get(false).is_empty() {
+            return false;
+        }
+        let img = self.rich_clip().and_then(|c| c.get_image().ok());
+        let Some(img) = img else { return false };
+        let png = match encode_png(img.width as u32, img.height as u32, &img.bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                self.toast(wid, format!("Image encode failed: {e}"));
+                return true;
+            }
+        };
+        let name = format!("clip-{}.png", timestamp());
+        let remote = self.panes.get(&pane).and_then(|p| p.remote_target());
+        match remote {
+            Some(r) => self.upload(wid, pane, r, vec![(name, png)]),
+            None => {
+                let dir = dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("dtem/clipboard");
+                let path = dir.join(&name);
+                match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &png)) {
+                    Ok(_) => {
+                        self.paste_into(pane, &remote::shell_quote(&path.display().to_string()));
+                        self.toast(wid, format!("Image saved: {}", path.display()));
+                    }
+                    Err(e) => self.toast(wid, format!("Cannot save image: {e}")),
+                }
+            }
+        }
+        true
+    }
+
+    fn send_paths(&mut self, wid: WindowId, pane: u64, paths: Vec<PathBuf>) {
+        let remote = self.panes.get(&pane).and_then(|p| p.remote_target());
+        match remote {
+            Some(r) => {
+                let mut items = Vec::new();
+                for p in paths {
+                    match std::fs::read(&p) {
+                        Ok(d) => items.push((p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or("file".into()), d)),
+                        Err(e) => self.toast(wid, format!("{}: {e}", p.display())),
+                    }
+                }
+                if !items.is_empty() {
+                    self.upload(wid, pane, r, items);
+                }
+            }
+            None => {
+                let text = paths.iter().map(|p| remote::shell_quote(&p.display().to_string())).collect::<Vec<_>>().join(" ");
+                self.paste_into(pane, &format!("{text} "));
+            }
+        }
+    }
+
+    /// Upload in the background, then type the remote paths into the pane.
+    fn upload(&mut self, wid: WindowId, pane: u64, r: Remote, items: Vec<(String, Vec<u8>)>) {
+        let total: usize = items.iter().map(|(_, d)| d.len()).sum();
+        self.toast(wid, format!("Uploading {} file(s), {} to {}…", items.len(), human_size(total), r.label()));
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            let mut paths = Vec::new();
+            for (name, data) in items {
+                match r.upload(&data, &name) {
+                    Ok(p) => paths.push(remote::shell_quote(&p)),
+                    Err(e) => {
+                        let _ = proxy.send_event(UserEvent::Toast(pane, format!("Upload failed: {e}")));
+                        return;
+                    }
+                }
+            }
+            let n = paths.len();
+            let _ = proxy.send_event(UserEvent::InsertText(pane, format!("{} ", paths.join(" "))));
+            let _ = proxy.send_event(UserEvent::Toast(pane, format!("Uploaded {n} file(s) to {}", r.label())));
+        });
+    }
+
+    /// `dtem-copy FILE` on the remote: fetch it and put it on the local clipboard.
+    fn fetch_remote_file(&mut self, pane: u64, path: String) {
+        let Some(r) = self.panes.get(&pane).and_then(|p| p.remote_target()) else {
+            self.toast_pane(pane, "dtem-copy: pane is not an ssh session");
+            return;
+        };
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || match r.fetch(&path) {
+            Ok(data) => {
+                let name = std::path::Path::new(&path).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or("file".into());
+                let _ = proxy.send_event(UserEvent::RemoteFile(pane, name, data));
+            }
+            Err(e) => {
+                let _ = proxy.send_event(UserEvent::Toast(pane, format!("Fetching {path} failed: {e}")));
+            }
+        });
+    }
+
+    fn on_remote_file(&mut self, pane: u64, name: String, data: Vec<u8>) {
+        if let Ok(img) = image::load_from_memory(&data) {
+            let rgba = img.to_rgba8();
+            let (w, h) = rgba.dimensions();
+            let res = self.rich_clip().map(|c| {
+                c.set_image(arboard::ImageData { width: w as usize, height: h as usize, bytes: rgba.into_raw().into() })
+            });
+            match res {
+                Some(Ok(_)) => self.toast_pane(pane, format!("Copied image {name} ({w}×{h}) to clipboard")),
+                _ => self.toast_pane(pane, "Cannot set clipboard image"),
+            }
+            return;
+        }
+        // Other files: save under ~/Downloads/dtem and copy as a file (paste in the file manager)
+        let dir = dirs::download_dir().unwrap_or_else(|| dirs::home_dir().unwrap_or_default()).join("dtem");
+        let mut path = dir.join(&name);
+        let mut i = 1;
+        while path.exists() {
+            path = dir.join(format!("{i}-{name}"));
+            i += 1;
+        }
+        match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &data)) {
+            Ok(_) => {
+                let _ = self.rich_clip().map(|c| c.set().file_list(&[&path]));
+                self.toast_pane(pane, format!("Saved {} ({}) and copied as file", path.display(), human_size(data.len())));
+            }
+            Err(e) => self.toast_pane(pane, format!("Cannot save {name}: {e}")),
+        }
+    }
+
+    // ---- URLs
+
+    /// URL (or OSC 8 hyperlink) at a grid point: (first col, last col, url)
+    fn url_at(&self, pane: u64, point: Point) -> Option<(usize, usize, String)> {
+        let p = self.panes.get(&pane)?;
+        let term = p.term.lock();
+        let grid = term.grid();
+        let row = &grid[point.line];
+        let cols = grid.columns();
+        if let Some(h) = row[point.column].hyperlink() {
+            let uri = h.uri().to_string();
+            let same = |c: usize| row[Column(c)].hyperlink().map(|x| x.uri() == uri).unwrap_or(false);
+            let mut a = point.column.0;
+            while a > 0 && same(a - 1) {
+                a -= 1;
+            }
+            let mut b = point.column.0;
+            while b + 1 < cols && same(b + 1) {
+                b += 1;
+            }
+            return Some((a, b, uri));
+        }
+        // plain-text URL detection on the row
+        let mut text = String::new();
+        let mut col_of = Vec::new(); // byte index -> col
+        for c in 0..cols {
+            let cell = &row[Column(c)];
+            if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
+                continue;
+            }
+            let ch = if cell.c == '\0' { ' ' } else { cell.c };
+            for _ in 0..ch.len_utf8() {
+                col_of.push(c);
+            }
+            text.push(ch);
+        }
+        for m in self.url_re.find_iter(&text) {
+            let mut url = m.as_str();
+            // trim trailing punctuation, keep ')' when the URL has a matching '('
+            while let Some(last) = url.chars().last() {
+                let unbalanced_paren = last == ')' && url.matches('(').count() < url.matches(')').count();
+                if ".,;:!?'\"]".contains(last) || unbalanced_paren {
+                    url = &url[..url.len() - last.len_utf8()];
+                } else {
+                    break;
+                }
+            }
+            if url.is_empty() {
+                continue;
+            }
+            let (a, b) = (col_of[m.start()], col_of[m.start() + url.len() - 1]);
+            if (a..=b).contains(&point.column.0) {
+                let url = if url.starts_with("www.") { format!("https://{url}") } else { url.to_string() };
+                return Some((a, b, url));
+            }
+        }
+        None
+    }
+
+    fn update_hover(&mut self, wid: WindowId) {
+        let Some(win) = self.windows.get(&wid) else { return };
+        let (x, y) = win.cursor;
+        let mut hover = None;
+        if self.modifiers.control_key() {
+            if let Some((id, rect)) = self.pane_at(wid, x, y) {
+                let (point, _, _, _) = self.cell_at(wid, id, rect, x, y);
+                hover = self.url_at(id, point).map(|(a, b, u)| (id, point.line.0, a, b, u));
+            }
+        }
+        let win = self.windows.get_mut(&wid).unwrap();
+        let changed = win.hover_url.as_ref().map(|h| (h.0, h.1, h.2)) != hover.as_ref().map(|h| (h.0, h.1, h.2));
+        let pointer = hover.is_some();
+        win.hover_url = hover;
+        if pointer != win.pointer_cursor {
+            win.pointer_cursor = pointer;
+            win.window.set_cursor(if pointer { winit::window::CursorIcon::Pointer } else { winit::window::CursorIcon::Text });
+        }
+        if changed {
+            win.window.request_redraw();
+        }
+    }
+
+    fn open_url(&self, url: &str) {
+        let mut parts = self.cfg.open_url_with.split_whitespace();
+        let Some(prog) = parts.next() else { return };
+        match std::process::Command::new(prog).args(parts).arg(url).spawn() {
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+            Err(e) => log::error!("cannot open {url}: {e}"),
+        }
+    }
+}
+
+fn timestamp() -> String {
+    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    format!("{}{:03}", d.as_secs(), d.subsec_millis())
+}
+
+fn human_size(n: usize) -> String {
+    match n {
+        n if n >= 1 << 20 => format!("{:.1} MB", n as f64 / (1 << 20) as f64),
+        n if n >= 1 << 10 => format!("{:.0} KB", n as f64 / 1024.0),
+        n => format!("{n} B"),
+    }
+}
+
+fn encode_png(w: u32, h: u32, rgba: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let img = image::RgbaImage::from_raw(w, h, rgba.to_vec()).ok_or_else(|| anyhow::anyhow!("bad image data"))?;
+    let mut out = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut out, image::ImageFormat::Png)?;
+    Ok(out.into_inner())
 }

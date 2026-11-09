@@ -32,6 +32,20 @@ pub struct Config {
     pub force_x11: bool,
     /// Modifier used for `kitty_mod` in key bindings
     pub kitty_mod: String,
+    /// Programming ligatures (fonts like Fira Code / JetBrains Mono)
+    pub ligatures: bool,
+    /// 0.0..1.0 — needs a compositor
+    pub background_opacity: f32,
+    /// Input method (ibus/fcitx) support
+    pub ime: bool,
+    /// Allow apps (nvim, ...) to enable the kitty keyboard protocol
+    pub kitty_keyboard: bool,
+    /// Programs reading the clipboard via OSC 52 (e.g. remote nvim): "ask" | "allow" | "deny"
+    pub clipboard_read: String,
+    /// Command used to open URLs (ctrl+click)
+    pub open_url_with: String,
+    /// Install the `dtem-copy` helper on hosts opened with `dtem --remote`
+    pub remote_install_helpers: bool,
     pub colors: Colors,
     pub dropdown: Dropdown,
     /// Ask before closing (each can be disabled)
@@ -138,6 +152,13 @@ impl Default for Config {
             copy_on_select: false,
             force_x11: false,
             kitty_mod: "ctrl+shift".into(),
+            ligatures: true,
+            background_opacity: 1.0,
+            ime: true,
+            kitty_keyboard: true,
+            clipboard_read: "ask".into(),
+            open_url_with: "xdg-open".into(),
+            remote_install_helpers: true,
             colors: Colors::default(),
             dropdown: Dropdown::default(),
             confirm_close: ConfirmClose::default(),

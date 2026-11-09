@@ -484,3 +484,148 @@ pub fn encode(ev: &KeyEvent, mods: ModifiersState, mode: TermMode) -> Option<Vec
     }
     Some(alt_prefix(text.as_bytes().to_vec()))
 }
+
+// ---------------------------------------------------------------- kitty keyboard protocol
+// https://sw.kovidgoyal.net/kitty/keyboard-protocol/
+
+enum Fk {
+    /// CSI 1;mods X  (arrows, home/end, F1/F2/F4)
+    Letter(char),
+    /// CSI n;mods ~
+    Tilde(u32),
+    /// CSI code;mods u
+    U(u32),
+}
+
+fn functional(ev: &KeyEvent) -> Option<Fk> {
+    use winit::keyboard::KeyLocation;
+    let right = ev.location == KeyLocation::Right;
+    let Key::Named(n) = &ev.logical_key else { return None };
+    Some(match n {
+        NamedKey::Escape => Fk::U(27),
+        NamedKey::Enter => Fk::U(13),
+        NamedKey::Tab => Fk::U(9),
+        NamedKey::Backspace => Fk::U(127),
+        NamedKey::Insert => Fk::Tilde(2),
+        NamedKey::Delete => Fk::Tilde(3),
+        NamedKey::PageUp => Fk::Tilde(5),
+        NamedKey::PageDown => Fk::Tilde(6),
+        NamedKey::ArrowUp => Fk::Letter('A'),
+        NamedKey::ArrowDown => Fk::Letter('B'),
+        NamedKey::ArrowRight => Fk::Letter('C'),
+        NamedKey::ArrowLeft => Fk::Letter('D'),
+        NamedKey::Home => Fk::Letter('H'),
+        NamedKey::End => Fk::Letter('F'),
+        NamedKey::F1 => Fk::Letter('P'),
+        NamedKey::F2 => Fk::Letter('Q'),
+        NamedKey::F3 => Fk::Tilde(13),
+        NamedKey::F4 => Fk::Letter('S'),
+        NamedKey::F5 => Fk::Tilde(15),
+        NamedKey::F6 => Fk::Tilde(17),
+        NamedKey::F7 => Fk::Tilde(18),
+        NamedKey::F8 => Fk::Tilde(19),
+        NamedKey::F9 => Fk::Tilde(20),
+        NamedKey::F10 => Fk::Tilde(21),
+        NamedKey::F11 => Fk::Tilde(23),
+        NamedKey::F12 => Fk::Tilde(24),
+        NamedKey::CapsLock => Fk::U(57358),
+        NamedKey::ScrollLock => Fk::U(57359),
+        NamedKey::NumLock => Fk::U(57360),
+        NamedKey::PrintScreen => Fk::U(57361),
+        NamedKey::Pause => Fk::U(57362),
+        NamedKey::ContextMenu => Fk::U(57363),
+        NamedKey::Shift => Fk::U(if right { 57447 } else { 57441 }),
+        NamedKey::Control => Fk::U(if right { 57448 } else { 57442 }),
+        NamedKey::Alt => Fk::U(if right { 57449 } else { 57443 }),
+        NamedKey::Super => Fk::U(if right { 57450 } else { 57444 }),
+        _ => return None,
+    })
+}
+
+fn is_modifier_key(ev: &KeyEvent) -> bool {
+    matches!(
+        ev.logical_key,
+        Key::Named(NamedKey::Shift | NamedKey::Control | NamedKey::Alt | NamedKey::Super)
+    )
+}
+
+/// Encode a key event using the kitty keyboard protocol.
+/// `event`: 1 press, 2 repeat, 3 release.
+pub fn encode_kitty(ev: &KeyEvent, mods: ModifiersState, mode: TermMode, event: u8) -> Option<Vec<u8>> {
+    let all = mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC);
+    let types = mode.contains(TermMode::REPORT_EVENT_TYPES);
+    let alt_keys = mode.contains(TermMode::REPORT_ALTERNATE_KEYS);
+    let assoc = mode.contains(TermMode::REPORT_ASSOCIATED_TEXT);
+    let event = if types { event } else if event == 3 { return None } else { 1 };
+    let m = mod_param(mods) as u32;
+    let ev_suffix = if event > 1 { format!(":{event}") } else { String::new() };
+    let mods_part = |force: bool| -> String {
+        if m > 1 || event > 1 || force {
+            format!(";{m}{ev_suffix}")
+        } else {
+            String::new()
+        }
+    };
+
+    if let Some(fk) = functional(ev) {
+        if is_modifier_key(ev) && !all {
+            return None;
+        }
+        let plain = m == 1;
+        match fk {
+            Fk::U(code @ (13 | 9 | 127)) if !all && plain => {
+                if event == 3 {
+                    return None;
+                }
+                return Some(match code {
+                    13 => b"\r".to_vec(),
+                    9 => b"\t".to_vec(),
+                    _ => vec![0x7f],
+                });
+            }
+            Fk::U(code) => return Some(format!("\x1b[{code}{}u", mods_part(false)).into_bytes()),
+            Fk::Letter(c) => {
+                if !all && event == 1 {
+                    return encode(ev, mods, mode);
+                }
+                return Some(format!("\x1b[1{}{c}", mods_part(true)).into_bytes());
+            }
+            Fk::Tilde(n) => {
+                if !all && event == 1 {
+                    return encode(ev, mods, mode);
+                }
+                return Some(format!("\x1b[{n}{}~", mods_part(false)).into_bytes());
+            }
+        }
+    }
+
+    // Text-producing key
+    let base = match ev.key_without_modifiers() {
+        Key::Character(s) => s.chars().next()?,
+        Key::Named(NamedKey::Space) => ' ',
+        _ => return None,
+    };
+    let code = base.to_lowercase().next().unwrap_or(base) as u32;
+    let text = ev.text.as_ref().map(|t| t.to_string()).filter(|t| t.chars().all(|c| !c.is_control()));
+    let has_cm = mods.control_key() || mods.alt_key() || mods.super_key();
+    if !all && !has_cm {
+        return match event {
+            3 => None,
+            _ => text.map(|t| t.into_bytes()),
+        };
+    }
+    let mut key = code.to_string();
+    if alt_keys && mods.shift_key() {
+        if let Some(shifted) = text.as_ref().and_then(|t| t.chars().next()) {
+            if shifted as u32 != code {
+                key = format!("{code}:{}", shifted as u32);
+            }
+        }
+    }
+    let text_part = match (&text, assoc && all && event != 3) {
+        (Some(t), true) => format!(";{}", t.chars().map(|c| (c as u32).to_string()).collect::<Vec<_>>().join(":")),
+        _ => String::new(),
+    };
+    let mp = if text_part.is_empty() { mods_part(false) } else { mods_part(true) };
+    Some(format!("\x1b[{key}{mp}{text_part}u").into_bytes())
+}

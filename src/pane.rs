@@ -49,6 +49,8 @@ pub struct Pane {
     /// Last known cwd (kept if the process can't be inspected anymore)
     pub last_cwd: Option<PathBuf>,
     pub exited: bool,
+    /// Pane opened with `dtem --remote`
+    pub remote: Option<crate::remote::Remote>,
 }
 
 pub struct SpawnOpts {
@@ -57,6 +59,9 @@ pub struct SpawnOpts {
     pub restore: Option<Vec<u8>>,
     pub persist_id: Option<String>,
     pub title: Option<String>,
+    /// Run this program directly instead of the shell (used for remote panes)
+    pub program: Option<(String, Vec<String>)>,
+    pub remote: Option<crate::remote::Remote>,
 }
 
 pub fn new_persist_id() -> String {
@@ -81,7 +86,13 @@ impl Pane {
         let cols = cols.max(2);
         let rows = rows.max(1);
         let listener = Listener { pane: id, proxy };
-        let tcfg = TermConfig { scrolling_history: cfg.scrollback_lines, ..Default::default() };
+        let tcfg = TermConfig {
+            scrolling_history: cfg.scrollback_lines,
+            kitty_keyboard: cfg.kitty_keyboard,
+            // Reads are gated by `clipboard_read` in the app (ask/allow/deny)
+            osc52: alacritty_terminal::term::Osc52::CopyPaste,
+            ..Default::default()
+        };
         let mut term = Term::new(tcfg, &TermSize::new(cols, rows), listener.clone());
 
         if let Some(bytes) = opts.restore.as_ref().filter(|b| !b.is_empty()) {
@@ -97,6 +108,10 @@ impl Pane {
         env.insert("COLORTERM".to_string(), "truecolor".to_string());
         env.insert("TERM_PROGRAM".to_string(), "dtem".to_string());
         let shell_opt = match &opts.command {
+            _ if opts.program.is_some() => {
+                let (prog, args) = opts.program.clone().unwrap();
+                Some(tty::Shell::new(prog, args))
+            }
             Some(cmd) if !cmd.trim().is_empty() => Some(tty::Shell::new(
                 shell.clone(),
                 vec!["-c".into(), format!("{cmd}; exec {shell}")],
@@ -133,6 +148,7 @@ impl Pane {
             dirty: true,
             last_cwd: cwd,
             exited: false,
+            remote: opts.remote,
         })
     }
 
@@ -169,6 +185,14 @@ impl Pane {
         self.last_cwd.clone()
     }
 
+    /// SSH target for clipboard/file transfer: the pane's own remote, or a foreground `ssh`.
+    pub fn remote_target(&self) -> Option<crate::remote::Remote> {
+        if let Some(r) = &self.remote {
+            return Some(r.clone());
+        }
+        crate::remote::detect_foreground_ssh(self.pty_fd)
+    }
+
     /// True if the shell itself is in the foreground (no program running).
     pub fn shell_idle(&self) -> bool {
         let pg = unsafe { libc::tcgetpgrp(self.pty_fd) };
@@ -179,6 +203,9 @@ impl Pane {
     pub fn display_title(&mut self) -> String {
         if !self.title.is_empty() {
             return self.title.clone();
+        }
+        if let Some(r) = &self.remote {
+            return format!("⇄ {}", r.label());
         }
         self.cwd()
             .map(|p| {

@@ -13,6 +13,11 @@ GPU-accelerated terminal emulator. It runs as a normal window or as a dropdown, 
 - Dropdown mode is a separate process with its own session. It remembers **the monitor you last moved it to**.
 - Ships kitty-like shortcuts, all of them configurable.
 - Asks for confirmation before closing a tab, pane or window. You can turn this off in the config.
+- **Text rendering:** programming **ligatures** (via swash shaping) and **color emoji**.
+- **Links:** Ctrl+click opens URLs and OSC 8 hyperlinks. They are underlined while Ctrl is held.
+- **Input:** **IME** support (ibus/fcitx) and the **kitty keyboard protocol**, which nvim and similar apps can turn on.
+- **Transparency:** background opacity is configurable (needs a compositor).
+- **`dtem --remote`:** SSH with clipboard and file sync (see below).
 
 ## Usage
 
@@ -21,12 +26,36 @@ dtem                          normal window (restores the last session)
 dtem --dropdown [--hidden]    dropdown terminal
 dtem --toggle                 show/hide dropdown (bind this to a key)
 dtem --session FILE.json      open a layout file
+dtem --remote [ssh args] HOST ssh in a new tab with clipboard/file sync
 dtem --no-restore             start fresh
 dtem --install-gnome-shortcut register the dropdown hotkey in GNOME
 dtem --quit [--dropdown]      quit the running instance (session saved)
 ```
 
 Install: `./install.sh --shortcut`
+
+## Remote (SSH) and clipboard sync
+
+```
+dtem --remote user@host
+dtem --remote -p 2222 -i ~/.ssh/key user@host     # any ssh options
+```
+
+Opens an ssh session in a new tab. The session is multiplexed through an SSH ControlMaster, so file transfers reuse the same authenticated connection and never ask for a password again.
+
+| What | How |
+|---|---|
+| Local image → remote | Copy an image (e.g. a screenshot) and press `kitty_mod+v` in the ssh pane. dtem uploads it to `~/.cache/dtem/uploads/` on the server and types its path, which is handy for CLI tools that take image paths. |
+| Local files → remote | Copy files in the file manager and paste, or drag & drop them onto the pane. They are uploaded and their paths are typed. |
+| Remote text → local clipboard | `echo hi \| dtem-copy`, or any program using OSC 52 (nvim, tmux with `set-clipboard on`). |
+| Remote image/file → local clipboard | `dtem-copy shot.png`. Images go on your clipboard as images. Other files are saved to `~/Downloads/dtem/` and copied as files. |
+| Remote programs reading your clipboard (OSC 52) | Asks first: allow once / always / deny (`clipboard_read`). |
+
+- **Helper install:** `dtem-copy` is installed into `~/.local/bin` on the server on first connect. Turn this off with `remote_install_helpers = false`.
+- **Manually started ssh:** if you start `ssh host` yourself inside a local pane, image/file paste still works through a separate `ssh -o BatchMode=yes` connection. That connection needs key or agent authentication.
+- **Disconnect:** the pane offers to reconnect.
+- **After restore:** remote tabs come back with their scrollback and ask before reconnecting. Programs are never restarted.
+- **Local panes:** pasting an image saves it under `~/.cache/dtem/clipboard/` and types the local path.
 
 ## Dropdown and monitors
 
@@ -62,6 +91,7 @@ Install: `./install.sh --shortcut`
 | move pane | `kitty_mod+f` / `kitty_mod+b` |
 | zoom pane | `kitty_mod+l` |
 | copy / paste / paste selection | `kitty_mod+c` / `kitty_mod+v` / `shift+insert` |
+| open URL | `ctrl+click` |
 | scroll | `kitty_mod+↑/↓/k/j`, `shift+pgup/pgdn`, `kitty_mod+home/end` |
 | clear scrollback | `kitty_mod+delete` |
 | font size | `kitty_mod+=` / `kitty_mod+-` / `kitty_mod+backspace` |

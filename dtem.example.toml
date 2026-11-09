@@ -22,6 +22,14 @@ force_x11 = false
 
 kitty_mod = "ctrl+shift"
 
+ligatures = true             # Fira Code, JetBrains Mono, Cascadia… (font_family can also be a file path)
+background_opacity = 1.0     # < 1.0 = transparent background (needs a compositor)
+ime = true                   # ibus / fcitx input methods
+kitty_keyboard = true        # apps like nvim may enable the kitty keyboard protocol
+clipboard_read = "ask"       # OSC 52 clipboard *reads* by programs: ask | allow | deny
+open_url_with = "xdg-open"   # ctrl+click on URLs
+remote_install_helpers = true  # install `dtem-copy` on hosts opened with dtem --remote
+
 [confirm_close]
 tab = true        # ask before closing a tab
 pane = true       # ask before closing a split pane

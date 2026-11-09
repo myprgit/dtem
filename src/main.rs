@@ -4,6 +4,7 @@ mod font;
 mod keys;
 mod layout;
 mod pane;
+mod remote;
 mod renderer;
 mod session;
 
@@ -16,6 +17,12 @@ pub enum UserEvent {
     Term(u64, alacritty_terminal::event::Event),
     Command(String),
     Signal,
+    /// Text to type into a pane (e.g. uploaded file paths)
+    InsertText(u64, String),
+    Toast(u64, String),
+    /// File fetched from a remote host via `dtem-copy`
+    RemoteFile(u64, String, Vec<u8>),
+    Redraw(winit::window::WindowId),
 }
 
 const HELP: &str = "dtem — GPU accelerated terminal
@@ -26,6 +33,7 @@ USAGE:
   dtem --dropdown --hidden      start the dropdown hidden (for autostart)
   dtem --toggle                 show/hide the dropdown (starts it if needed)
   dtem --session FILE.json      open a layout/session file
+  dtem --remote [ssh args] HOST open an ssh session in a new tab (clipboard/file sync)
   dtem --no-restore             don't restore the previous session
   dtem --install-gnome-shortcut register the dropdown hotkey in GNOME (X11 + Wayland)
   dtem --quit [--dropdown]      quit the running instance (session is saved)
@@ -41,6 +49,7 @@ struct Args {
     session: Option<PathBuf>,
     install_shortcut: bool,
     quit: bool,
+    remote: Option<Vec<String>>,
 }
 
 fn parse_args() -> Args {
@@ -52,6 +61,7 @@ fn parse_args() -> Args {
         session: None,
         install_shortcut: false,
         quit: false,
+        remote: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -65,6 +75,14 @@ fn parse_args() -> Args {
             }
             "--install-gnome-shortcut" => a.install_shortcut = true,
             "--quit" => a.quit = true,
+            "--remote" | "-r" => {
+                let rest: Vec<String> = it.by_ref().collect();
+                if rest.is_empty() {
+                    eprintln!("--remote needs an ssh destination, e.g. dtem --remote user@host");
+                    std::process::exit(2);
+                }
+                a.remote = Some(rest);
+            }
             "-h" | "--help" => {
                 println!("{HELP}");
                 std::process::exit(0);
@@ -199,6 +217,9 @@ fn main() {
         match (role, &args.session) {
             (app::Role::Dropdown, _) if args.hidden => String::new(),
             (app::Role::Dropdown, _) => "toggle".into(),
+            (app::Role::Main, _) if args.remote.is_some() => {
+                format!("remote {}", serde_json::to_string(args.remote.as_ref().unwrap()).unwrap())
+            }
             (app::Role::Main, Some(p)) => format!("session {}", p.display()),
             (app::Role::Main, None) => "new-window".into(),
         }
@@ -270,6 +291,7 @@ fn main() {
         restore: !args.no_restore,
         session_file: args.session.clone(),
         show_dropdown: !args.hidden,
+        remote: args.remote.clone(),
     };
     let mut app = match app::App::new(cfg, role, proxy, startup) {
         Ok(a) => a,
