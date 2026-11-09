@@ -6,7 +6,10 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 cargo build --release
-install -Dm755 target/release/dtem "$HOME/.local/bin/dtem"
+# replace atomically (works while dtem is running; running instances keep the old binary)
+mkdir -p "$HOME/.local/bin"
+install -m755 target/release/dtem "$HOME/.local/bin/.dtem.new"
+mv -f "$HOME/.local/bin/.dtem.new" "$HOME/.local/bin/dtem"
 
 apps="$HOME/.local/share/applications"
 mkdir -p "$apps" "$HOME/.config/autostart" "$HOME/.config/dtem"

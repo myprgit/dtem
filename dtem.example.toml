@@ -1,65 +1,112 @@
-# dtem config — copy to ~/.config/dtem/dtem.toml
-# Every key is optional; defaults shown.
+# dtem config — ~/.config/dtem/dtem.toml
+# Every key is optional. Changes are applied live. Easiest way to edit: the settings page
+# (kitty_mod+F2 or ctrl+, inside dtem, or `dtem --settings`). Import tilda: `dtem --import-tilda`.
 
-font_family = "monospace"      # any fontconfig name, e.g. "JetBrains Mono"
-font_size = 11.0               # points
+# ---- look
+font_family = "monospace"        # fontconfig name or a font file path
+font_size = 11.0
 line_height = 1.0
 padding = 4.0
+ligatures = true
+color_scheme = "tokyo-night"     # tokyo-night tango white-on-black green-on-black black-on-white linux xterm
+                                 # rxvt zenburn solarized-dark solarized-light snazzy dracula gruvbox-dark
+                                 # nord catppuccin-mocha one-dark
+transparency = false             # toggle live with the `toggle_transparency` action
+background_opacity = 0.85
+cursor_shape = "block"           # block | beam | underline
+cursor_blink = false
+bold_is_bright = false
+scrollbar = "none"               # none | right | left
+
+# ---- tabs & titles
+tab_bar_min_tabs = 2             # 1 = always show the tab bar
+tab_bar_position = "top"         # top | bottom | hidden
+tab_bar_expand = false
+new_tab_after_current = true
+title = "dtem"
+dynamic_title = "replace"        # replace | before | after | none
+title_max_length = 0             # 0 = unlimited
+title_truncate = "end"           # end | start | none
+
+# ---- scrolling, selection, links
 scrollback_lines = 10000
-cursor_shape = "block"         # block | beam | underline
+scrollback_infinite = false
+scroll_on_output = false
+scroll_on_key = true
+word_chars = ""                  # e.g. "-A-Za-z0-9,./?%&#:_" (empty = default)
 copy_on_select = false
-tab_bar_min_tabs = 2           # like kitty: show tab bar from 2 tabs on (1 = always)
-# shell = "/usr/bin/zsh"       # default: $SHELL
+open_url_with = "xdg-open"
+url_requires_ctrl = true
+match_web_uris = true
+match_file_uris = true
+match_email = true
 
-# --- persistence (restart / reboot) ---
-persist_scrollback = true
-persist_scrollback_lines = 10000
-autosave_interval_secs = 5     # session is also saved on exit and on SIGTERM/SIGHUP
-
-# Wayland: normal windows are native Wayland. Wayland doesn't let apps restore window
-# positions; set this to run them via XWayland if you want positions restored too.
-force_x11 = false
-
+# ---- keyboard
+backspace_sends = "auto"         # auto | del | bs | escape
+delete_sends = "escape"          # escape | del | bs | auto
+ime = true
+kitty_keyboard = true
 kitty_mod = "ctrl+shift"
 
-ligatures = true             # Fira Code, JetBrains Mono, Cascadia… (font_family can also be a file path)
-background_opacity = 1.0     # < 1.0 = transparent background (needs a compositor)
-ime = true                   # ibus / fcitx input methods
-kitty_keyboard = true        # apps like nvim may enable the kitty keyboard protocol
-clipboard_read = "ask"       # OSC 52 clipboard *reads* by programs: ask | allow | deny
-open_url_with = "xdg-open"   # ctrl+click on URLs
-remote_install_helpers = true  # install `dtem-copy` on hosts opened with dtem --remote
+# ---- shell
+# shell = "/usr/bin/zsh"
+command = ""                     # run in new tabs
+command_exit = "shell"           # shell | restart | close
+login_shell = false
+working_dir = ""
+inherit_working_dir = true
+
+# ---- bell
+bell = true
+visual_bell = false
+
+# ---- session (restart / reboot)
+persist_scrollback = true
+persist_scrollback_lines = 10000
+autosave_interval_secs = 5
+
+# ---- misc
+force_x11 = false                # Wayland: run normal windows via XWayland (restores positions)
+clipboard_read = "ask"           # OSC 52 reads by programs: ask | allow | deny
+remote_install_helpers = true
 
 [confirm_close]
-tab = true        # ask before closing a tab
-pane = true       # ask before closing a split pane
-window = true     # ask before closing a window / quitting
+tab = true
+pane = true
+window = true                    # also offers "quit without saving"
 
 [dropdown]
-hotkey = "F12"               # X11: grabbed directly. GNOME (X11+Wayland): dtem --install-gnome-shortcut
-height = 0.45                # fraction of the monitor
+hotkey = "F12"                   # or a list: ["F1", "ctrl+alt+t"]
 width = 1.0
+height = 0.45
+centered_horizontally = true
+centered_vertically = false
+x = 0
+y = 0
+monitor = ""                     # first-time monitor (e.g. "DP-1"); then the last used one is remembered
+animation = false
+animation_duration_ms = 180
+animation_from = "top"           # top | bottom | left | right
 hide_on_focus_loss = false
+hide_on_mouse_leave = false
+auto_hide_delay_ms = 0
+unfocused_toggle = "focus"       # hotkey while visible but unfocused: focus | hide
+grab_focus = true
+always_on_top = true
+skip_taskbar = true
+all_workspaces = true
+start_hidden = false
+start_fullscreen = false
+on_last_tab_exit = "new_tab_hide"  # new_tab_hide | new_tab | quit
 
+# Colors override the scheme (all optional):
 [colors]
-foreground = "#dddddd"
-background = "#1a1b26"
-cursor = "#c0caf5"
-cursor_text = "#1a1b26"
-selection_foreground = "#1a1b26"
-selection_background = "#7aa2f7"
-active_border = "#7aa2f7"
-inactive_border = "#3b4261"
-tab_bar_background = "#16161e"
-active_tab_foreground = "#1a1b26"
-active_tab_background = "#7aa2f7"
-inactive_tab_foreground = "#a9b1d6"
-inactive_tab_background = "#24283b"
-palette = ["#15161e", "#f7768e", "#9ece6a", "#e0af68", "#7aa2f7", "#bb9af7", "#7dcfff", "#a9b1d6",
-           "#414868", "#f7768e", "#9ece6a", "#e0af68", "#7aa2f7", "#bb9af7", "#7dcfff", "#c0caf5"]
+# foreground = "#dddddd"
+# background = "#1a1b26"
+# cursor = "#c0caf5"
+# palette = ["#15161e", "#f7768e", ...16 colors]
 
-# Override / add / remove key bindings. "none" removes a default.
+# "combo" = "action"; "none" removes a default binding
 [keybindings]
-# "kitty_mod+enter" = "vsplit"
-# "f5" = "none"
-# "ctrl+alt+left" = "neighboring_window_left"
+# "ctrl+shift+f" = "search"
+# "f12" = "toggle_transparency"

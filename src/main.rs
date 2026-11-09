@@ -1,4 +1,5 @@
 mod app;
+mod confedit;
 mod config;
 mod font;
 mod keys;
@@ -6,7 +7,11 @@ mod layout;
 mod pane;
 mod remote;
 mod renderer;
+mod schemes;
 mod session;
+mod settings;
+mod tilda;
+mod x11;
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -23,6 +28,8 @@ pub enum UserEvent {
     /// File fetched from a remote host via `dtem-copy`
     RemoteFile(u64, String, Vec<u8>),
     Redraw(winit::window::WindowId),
+    /// dtem.toml changed on disk
+    ConfigChanged,
 }
 
 const HELP: &str = "dtem — GPU accelerated terminal
@@ -36,7 +43,10 @@ USAGE:
   dtem --remote [ssh args] HOST open an ssh session in a new tab (clipboard/file sync)
   dtem --no-restore             don't restore the previous session
   dtem --install-gnome-shortcut register the dropdown hotkey in GNOME (X11 + Wayland)
-  dtem --quit [--dropdown]      quit the running instance (session is saved)
+  dtem --quit [--dropdown] [--no-save]
+                                quit the running instance (--no-save: forget the session)
+  dtem --settings               settings page (also kitty_mod+F2 / ctrl+, inside dtem)
+  dtem --import-tilda [FILE]    import a tilda config (default ~/.config/tilda/config_0)
 
 Config:  ~/.config/dtem/dtem.toml
 Session: ~/.local/state/dtem/";
@@ -49,6 +59,9 @@ struct Args {
     session: Option<PathBuf>,
     install_shortcut: bool,
     quit: bool,
+    no_save: bool,
+    settings: bool,
+    import_tilda: Option<Option<PathBuf>>,
     remote: Option<Vec<String>>,
 }
 
@@ -61,6 +74,9 @@ fn parse_args() -> Args {
         session: None,
         install_shortcut: false,
         quit: false,
+        no_save: false,
+        settings: false,
+        import_tilda: None,
         remote: None,
     };
     let mut it = std::env::args().skip(1);
@@ -75,6 +91,16 @@ fn parse_args() -> Args {
             }
             "--install-gnome-shortcut" => a.install_shortcut = true,
             "--quit" => a.quit = true,
+            "--no-save" => a.no_save = true,
+            "--settings" => a.settings = true,
+            "--import-tilda" => {
+                let next = it.next();
+                if next.as_deref().map(|n| n.starts_with('-')).unwrap_or(false) {
+                    eprintln!("--import-tilda takes an optional config file path");
+                    std::process::exit(2);
+                }
+                a.import_tilda = Some(next.map(PathBuf::from));
+            }
             "--remote" | "-r" => {
                 let rest: Vec<String> = it.by_ref().collect();
                 if rest.is_empty() {
@@ -144,7 +170,7 @@ pub fn hotkey_from_config(s: &str) -> Option<global_hotkey::hotkey::HotKey> {
 }
 
 /// GNOME accelerator syntax for gsettings, e.g. "<Control><Shift>F12".
-fn gnome_accel(s: &str) -> String {
+pub fn gnome_accel(s: &str) -> String {
     let parts: Vec<String> = s.split('+').map(|p| p.trim().to_string()).collect();
     let mut out = String::new();
     for p in &parts[..parts.len() - 1] {
@@ -169,29 +195,95 @@ fn gnome_accel(s: &str) -> String {
     out
 }
 
-fn install_gnome_shortcut(cfg: &config::Config) -> anyhow::Result<()> {
-    use std::process::Command;
+const MEDIA_KEYS: &str = "org.gnome.settings-daemon.plugins.media-keys";
+const CUSTOM_PREFIX: &str = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/";
+
+fn gsettings(args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("gsettings").args(args).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn unquote(s: &str) -> String {
+    s.trim().trim_matches('\'').to_string()
+}
+
+fn custom_paths() -> Vec<String> {
+    gsettings(&["get", MEDIA_KEYS, "custom-keybindings"])
+        .map(|cur| cur.split('\'').enumerate().filter(|(i, _)| i % 2 == 1).map(|(_, s)| s.to_string()).collect())
+        .unwrap_or_default()
+}
+
+fn custom_get(path: &str, key: &str) -> String {
+    gsettings(&["get", &format!("{MEDIA_KEYS}.custom-keybinding:{path}"), key]).map(|s| unquote(&s)).unwrap_or_default()
+}
+
+/// GNOME accelerators bound to `dtem --toggle`.
+pub fn gnome_dtem_accels() -> Vec<String> {
+    custom_paths()
+        .iter()
+        .filter(|p| custom_get(p, "command").contains("--toggle") && custom_get(p, "command").contains("dtem"))
+        .map(|p| custom_get(p, "binding").to_lowercase())
+        .collect()
+}
+
+fn accel_norm(a: &str) -> String {
+    a.to_lowercase().replace("<primary>", "<control>").replace("<ctrl>", "<control>")
+}
+
+/// Register every dropdown hotkey as a GNOME custom shortcut running `dtem --toggle`.
+/// Other custom shortcuts using the same key are disabled (reported).
+pub fn install_gnome_shortcut(cfg: &config::Config, quiet: bool) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
-    let base = "org.gnome.settings-daemon.plugins.media-keys";
-    let path = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/dtem-dropdown/";
-    let out = Command::new("gsettings").args(["get", base, "custom-keybindings"]).output()?;
-    let cur = String::from_utf8_lossy(&out.stdout).to_string();
-    let mut items: Vec<String> = cur.split('\'').enumerate().filter(|(i, _)| i % 2 == 1).map(|(_, s)| s.to_string()).collect();
-    if !items.iter().any(|p| p == path) {
-        items.push(path.to_string());
-    }
-    let list = format!("[{}]", items.iter().map(|p| format!("'{p}'")).collect::<Vec<_>>().join(", "));
-    let schema = format!("{base}.custom-keybinding:{path}");
-    let accel = gnome_accel(&cfg.dropdown.hotkey);
     let cmd = format!("{} --toggle", exe.display());
-    for (k, v) in [("name", "dtem dropdown"), ("command", cmd.as_str()), ("binding", accel.as_str())] {
-        let st = Command::new("gsettings").args(["set", &schema, k, v]).status()?;
-        anyhow::ensure!(st.success(), "gsettings set {k} failed");
+    let keys = cfg.dropdown.hotkey.list();
+    let mut paths = custom_paths();
+    // drop our previous entries
+    paths.retain(|p| !p.contains("/dtem-dropdown"));
+    let mut ours = Vec::new();
+    for (n, key) in keys.iter().enumerate() {
+        let accel = gnome_accel(key);
+        // disable conflicting shortcuts (e.g. tilda on Ctrl+Alt+T)
+        for p in &paths {
+            if accel_norm(&custom_get(p, "binding")) == accel_norm(&accel) {
+                let name = custom_get(p, "name");
+                gsettings(&["set", &format!("{MEDIA_KEYS}.custom-keybinding:{p}"), "binding", ""]);
+                if !quiet {
+                    println!("disabled GNOME shortcut \"{name}\" ({accel}) — it now opens dtem");
+                }
+            }
+        }
+        let path = if n == 0 { format!("{CUSTOM_PREFIX}dtem-dropdown/") } else { format!("{CUSTOM_PREFIX}dtem-dropdown-{}/", n + 1) };
+        let schema = format!("{MEDIA_KEYS}.custom-keybinding:{path}");
+        for (k, v) in [("name", "dtem dropdown"), ("command", cmd.as_str()), ("binding", accel.as_str())] {
+            anyhow::ensure!(gsettings(&["set", &schema, k, v]).is_some(), "gsettings set {k} failed");
+        }
+        ours.push(path);
+        if !quiet {
+            println!("GNOME shortcut: {accel} → {cmd}");
+        }
     }
-    let st = Command::new("gsettings").args(["set", base, "custom-keybindings", &list]).status()?;
-    anyhow::ensure!(st.success(), "gsettings set custom-keybindings failed");
-    println!("GNOME shortcut installed: {accel} → {cmd}");
+    paths.extend(ours);
+    let list = format!("[{}]", paths.iter().map(|p| format!("'{p}'")).collect::<Vec<_>>().join(", "));
+    anyhow::ensure!(gsettings(&["set", MEDIA_KEYS, "custom-keybindings", &list]).is_some(), "gsettings failed");
     Ok(())
+}
+
+fn watch_config(proxy: winit::event_loop::EventLoopProxy<UserEvent>) {
+    std::thread::spawn(move || {
+        let path = config::config_path();
+        let mtime = |p: &std::path::Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        let mut last = mtime(&path);
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            let now = mtime(&path);
+            if now != last {
+                last = now;
+                if proxy.send_event(UserEvent::ConfigChanged).is_err() {
+                    return;
+                }
+            }
+        }
+    });
 }
 
 fn main() {
@@ -200,9 +292,35 @@ fn main() {
     let cfg = config::Config::load();
 
     if args.install_shortcut {
-        if let Err(e) = install_gnome_shortcut(&cfg) {
+        if let Err(e) = install_gnome_shortcut(&cfg, false) {
             eprintln!("failed: {e}");
             std::process::exit(1);
+        }
+        return;
+    }
+    if args.settings {
+        if let Err(e) = settings::run() {
+            eprintln!("settings: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if let Some(p) = &args.import_tilda {
+        let path = p.clone().unwrap_or_else(|| dirs::config_dir().unwrap_or_default().join("tilda/config_0"));
+        match tilda::import(&path) {
+            Ok(r) => {
+                println!("Imported {} settings from {} into {}", r.applied, path.display(), config::config_path().display());
+                if let Some(b) = r.backup {
+                    println!("Previous config backed up to {}", b.display());
+                }
+                if !r.ignored.is_empty() {
+                    println!("Not applicable: {}", r.ignored.join(", "));
+                }
+            }
+            Err(e) => {
+                eprintln!("import failed: {e}");
+                std::process::exit(1);
+            }
         }
         return;
     }
@@ -212,7 +330,7 @@ fn main() {
 
     // Already running? Forward the request and exit.
     let cmd = if args.quit {
-        "quit".to_string()
+        if args.no_save { "quit-nosave".to_string() } else { "quit".to_string() }
     } else {
         match (role, &args.session) {
             (app::Role::Dropdown, _) if args.hidden => String::new(),
@@ -263,6 +381,7 @@ fn main() {
         }
     };
     let proxy = event_loop.create_proxy();
+    watch_config(proxy.clone());
 
     if let Some(l) = listener {
         let p = proxy.clone();
@@ -290,7 +409,8 @@ fn main() {
     let startup = app::Startup {
         restore: !args.no_restore,
         session_file: args.session.clone(),
-        show_dropdown: !args.hidden,
+        // `dtem --toggle` always shows; `dtem --dropdown` honours dropdown.start_hidden
+        show_dropdown: !args.hidden && (args.toggle || !cfg.dropdown.start_hidden),
         remote: args.remote.clone(),
     };
     let mut app = match app::App::new(cfg, role, proxy, startup) {

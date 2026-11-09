@@ -59,6 +59,8 @@ enum Confirm {
     Window,
     /// A program asked to read the clipboard (OSC 52)
     ClipRead(u64),
+    Quit,
+    QuitNoSave,
 }
 
 struct Tab {
@@ -86,6 +88,11 @@ struct OsWin {
     hover_url: Option<(u64, i32, usize, usize, String)>,
     pointer_cursor: bool,
     ime_area: Option<(i32, i32)>,
+    /// When the window last lost focus (the dropdown hotkey itself steals focus)
+    unfocused_at: Option<Instant>,
+    search: Option<SearchState>,
+    scroll_drag: Option<u64>,
+    bell_at: Option<Instant>,
     cursor: (f64, f64),
     left_down: bool,
     selecting: Option<u64>,
@@ -131,6 +138,15 @@ pub struct App {
     helpers_done: std::collections::HashSet<String>,
     last_focused: Option<WindowId>,
     url_re: regex::Regex,
+    keycfg: keys::KeyCfg,
+    transparency_on: bool,
+    x11: Option<crate::x11::X11>,
+    last_toggle: Option<Instant>,
+    anim: Option<Anim>,
+    pending_hide: Option<(WindowId, Instant)>,
+    last_input: Instant,
+    discard_session: bool,
+    installed_hotkeys: Vec<String>,
     exiting: bool,
 }
 
@@ -162,7 +178,17 @@ impl App {
         let fonts = FontSet::new(&cfg.font_family)?;
         Ok(App {
             bindings: Bindings::new(&cfg),
-            theme: Theme::from_config(&cfg.colors),
+            theme: Theme::from_config(&cfg),
+            keycfg: keys::KeyCfg::from_config(&cfg),
+            transparency_on: cfg.transparency,
+            url_re: build_url_regex(&cfg),
+            x11: None,
+            last_toggle: None,
+            anim: None,
+            pending_hide: None,
+            last_input: Instant::now(),
+            discard_session: false,
+            installed_hotkeys: Vec::new(),
             cfg,
             role,
             proxy,
@@ -185,7 +211,6 @@ impl App {
             pending_clip: HashMap::new(),
             helpers_done: Default::default(),
             last_focused: None,
-            url_re: regex::Regex::new(r#"(?:https?|ftp|file)://[^\s<>"'`{}|\\^]+|www\.[^\s<>"'`{}|\\^]+"#).unwrap(),
             exiting: false,
         })
     }
@@ -223,9 +248,12 @@ impl App {
             // Broken/unknown monitor info: use a sane default instead of a 0-sized window.
             s = PhysicalSize::new(1280, 800);
         }
-        let w = ((s.width as f32) * self.cfg.dropdown.width.clamp(0.1, 1.0)) as u32;
-        let h = ((s.height as f32) * self.cfg.dropdown.height.clamp(0.1, 1.0)) as u32;
-        (PhysicalPosition::new(p.x + (s.width as i32 - w as i32) / 2, p.y), PhysicalSize::new(w, h))
+        let d = &self.cfg.dropdown;
+        let w = ((s.width as f32) * d.width.clamp(0.1, 1.0)) as u32;
+        let h = ((s.height as f32) * d.height.clamp(0.1, 1.0)) as u32;
+        let x = if d.centered_horizontally { (s.width as i32 - w as i32) / 2 } else { d.x.min(s.width as i32 - w as i32).max(0) };
+        let y = if d.centered_vertically { (s.height as i32 - h as i32) / 2 } else { d.y.min(s.height as i32 - h as i32).max(0) };
+        (PhysicalPosition::new(p.x + x, p.y + y), PhysicalSize::new(w, h))
     }
 
     // ------------------------------------------------------------------ windows
@@ -239,7 +267,9 @@ impl App {
             attrs = WindowAttributesExtX11::with_name(attrs, class, class);
             attrs = WindowAttributesExtWayland::with_name(attrs, class, class);
         }
-        let mut monitor_name = ws.and_then(|w| w.monitor.clone());
+        let mut monitor_name = ws
+            .and_then(|w| w.monitor.clone())
+            .or_else(|| Some(self.cfg.dropdown.monitor.clone()).filter(|m| dropdown && !m.is_empty()));
         if dropdown {
             let mon = Self::monitor_by_name(el, monitor_name.as_deref()).or_else(|| Self::fallback_monitor(el));
             if let Some(m) = &mon {
@@ -247,10 +277,10 @@ impl App {
                 attrs = attrs.with_position(pos).with_inner_size(size);
                 monitor_name = m.name();
             }
-            attrs = attrs
-                .with_decorations(false)
-                .with_window_level(WindowLevel::AlwaysOnTop)
-                .with_visible(false);
+            attrs = attrs.with_decorations(false).with_visible(false);
+            if self.cfg.dropdown.always_on_top {
+                attrs = attrs.with_window_level(WindowLevel::AlwaysOnTop);
+            }
         } else {
             match ws.and_then(|w| w.width.zip(w.height)) {
                 Some((w, h)) => attrs = attrs.with_inner_size(PhysicalSize::new(w.max(100), h.max(60))),
@@ -266,9 +296,8 @@ impl App {
                 attrs = attrs.with_maximized(true);
             }
         }
-        if self.cfg.background_opacity < 1.0 {
-            attrs = attrs.with_transparent(true);
-        }
+        // Always request an alpha-capable window so transparency can be toggled live.
+        attrs = attrs.with_transparent(true);
         let window = match el.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {
@@ -277,6 +306,15 @@ impl App {
             }
         };
         window.set_ime_allowed(self.cfg.ime);
+        if dropdown {
+            if self.x11.is_none() {
+                self.x11 = crate::x11::X11::connect();
+            }
+            if let (Some(x), Some(id)) = (&self.x11, crate::x11::window_id(&window)) {
+                let d = &self.cfg.dropdown;
+                x.preset(id, d.skip_taskbar, d.all_workspaces, d.always_on_top);
+            }
+        }
         window.set_cursor(winit::window::CursorIcon::Text);
         if !dropdown && ws.map(|w| w.fullscreen).unwrap_or(false) {
             window.set_fullscreen(Some(Fullscreen::Borderless(None)));
@@ -316,7 +354,7 @@ impl App {
             size.width,
             size.height,
             metrics,
-            self.cfg.background_opacity,
+            self.cfg.effective_opacity(self.transparency_on),
         );
         let id = window.id();
         let pos = window.outer_position().ok().map(|p| (p.x, p.y));
@@ -339,6 +377,10 @@ impl App {
                 hover_url: None,
                 pointer_cursor: false,
                 ime_area: None,
+                unfocused_at: None,
+                search: None,
+                scroll_drag: None,
+                bell_at: None,
                 cursor: (0.0, 0.0),
                 left_down: false,
                 selecting: None,
@@ -361,7 +403,7 @@ impl App {
     }
 
     fn tab_bar_height(&self, win: &OsWin) -> f32 {
-        if win.tabs.len() >= self.cfg.tab_bar_min_tabs.max(1) {
+        if self.cfg.tab_bar_position != "hidden" && win.tabs.len() >= self.cfg.tab_bar_min_tabs.max(1) {
             (win.renderer.metrics.height + 6.0 * win.scale as f32).round()
         } else {
             0.0
@@ -371,7 +413,8 @@ impl App {
     fn content_rect(&self, win: &OsWin) -> Rect {
         let (w, h) = win.renderer.size();
         let tb = self.tab_bar_height(win);
-        Rect { x: 0.0, y: tb, w, h: (h - tb).max(1.0) }
+        let y = if self.cfg.tab_bar_position == "bottom" { 0.0 } else { tb };
+        Rect { x: 0.0, y, w, h: (h - tb).max(1.0) }
     }
 
     fn tab_layout(&self, win: &OsWin, tab: &Tab) -> Vec<(u64, Rect)> {
@@ -500,13 +543,18 @@ impl App {
     }
 
     fn new_tab(&mut self, wid: WindowId, cwd: Option<PathBuf>) {
-        let at = self.windows.get(&wid).map(|w| if w.tabs.is_empty() { 0 } else { w.active_tab + 1 });
+        let after = self.cfg.new_tab_after_current;
+        let at = self.windows.get(&wid).map(|w| if w.tabs.is_empty() { 0 } else if after { w.active_tab + 1 } else { w.tabs.len() });
+        let cwd = cwd.filter(|_| self.cfg.inherit_working_dir).or_else(|| {
+            Some(self.cfg.working_dir.trim()).filter(|d| !d.is_empty()).map(expand_tilde)
+        });
+        let command = Some(self.cfg.command.trim().to_string()).filter(|c| !c.is_empty());
         let ts = TabState {
             title: None,
             active: 0,
             layout: SNode::Leaf {
                 cwd: cwd.map(|p| p.display().to_string()),
-                command: None,
+                command,
                 scrollback: None,
                 title: None,
                 remote: None,
@@ -591,9 +639,19 @@ impl App {
         let Some(win) = self.windows.get(&wid) else { return };
         if win.tabs.is_empty() {
             if win.dropdown {
-                // Dropdown never disappears: give it a fresh shell and hide it.
-                self.new_tab(wid, None);
-                self.hide_dropdown(wid);
+                match self.cfg.dropdown.on_last_tab_exit.as_str() {
+                    "quit" => {
+                        self.save_session(true);
+                        self.exiting = true;
+                        el.exit();
+                        return;
+                    }
+                    "new_tab" => self.new_tab(wid, None),
+                    _ => {
+                        self.new_tab(wid, None);
+                        self.hide_dropdown(wid);
+                    }
+                }
             } else {
                 self.destroy_window(el, wid);
                 return;
@@ -656,7 +714,7 @@ impl App {
         let ask = match c {
             Confirm::Tab(_) => cc.tab,
             Confirm::Pane(_) => cc.pane,
-            Confirm::Window => cc.window,
+            Confirm::Window | Confirm::Quit | Confirm::QuitNoSave => cc.window,
             Confirm::ClipRead(_) => true,
         };
         if !ask {
@@ -682,6 +740,8 @@ impl App {
                     }
                 }
             }
+            Confirm::Quit => self.quit(el, false),
+            Confirm::QuitNoSave => self.quit(el, true),
             Confirm::Window => {
                 let normal_windows = self.windows.values().filter(|w| !w.dropdown).count();
                 if normal_windows == 1 && self.role == Role::Main {
@@ -696,9 +756,35 @@ impl App {
         }
     }
 
+    /// Quit the whole instance. `discard`: forget the session (next start is fresh).
+    fn quit(&mut self, el: &ActiveEventLoop, discard: bool) {
+        if discard {
+            let role = self.role.name();
+            let _ = std::fs::remove_file(session::session_path(role));
+            let _ = std::fs::remove_dir_all(session::scrollback_dir(role));
+            self.discard_session = true;
+        } else {
+            self.save_session(true);
+        }
+        self.exiting = true;
+        el.exit();
+    }
+
+    /// Confirmations that offer "quit without saving".
+    fn confirm_is_quit(&self, c: Confirm) -> bool {
+        match c {
+            Confirm::Quit => true,
+            Confirm::Window => self.role == Role::Main && self.windows.values().filter(|w| !w.dropdown).count() == 1,
+            _ => false,
+        }
+    }
+
     fn confirm_text(&self, wid: WindowId, c: Confirm) -> String {
         let win = &self.windows[&wid];
+        let tabs_all: usize = self.windows.values().map(|w| w.tabs.len()).sum();
         match c {
+            Confirm::Quit => format!("Quit dtem? ({tabs_all} tabs — restored on next start)"),
+            Confirm::QuitNoSave => "Quit and FORGET the session? (next start is empty)".to_string(),
             Confirm::Tab(i) => {
                 let n = win.tabs.get(i).map(|t| t.root.leaf_list().len()).unwrap_or(1);
                 if n > 1 {
@@ -742,25 +828,104 @@ impl App {
     }
 
     fn show_dropdown(&mut self, el: &ActiveEventLoop, wid: WindowId) {
+        self.pending_hide = None;
         self.apply_dropdown_geometry(el, wid);
+        let d = self.cfg.dropdown.clone();
+        let name = self.windows.get(&wid).and_then(|w| w.monitor.clone());
+        let mon = Self::monitor_by_name(el, name.as_deref()).or_else(|| Self::fallback_monitor(el));
+        let target = mon.as_ref().map(|m| self.dropdown_geometry(m));
         let win = self.windows.get_mut(&wid).unwrap();
+        if let (true, Some((pos, size)), Some(m)) = (d.animation, target, mon.as_ref()) {
+            let from = offscreen(&d.animation_from, m, pos, size);
+            win.window.set_outer_position(from);
+            self.anim = Some(Anim {
+                wid,
+                start: Instant::now(),
+                dur: Duration::from_millis(d.animation_duration_ms.max(1)),
+                from: (from.x, from.y),
+                to: (pos.x, pos.y),
+                hide: false,
+            });
+        }
         win.window.set_visible(true);
-        win.window.set_window_level(WindowLevel::AlwaysOnTop);
-        win.window.focus_window();
+        if d.always_on_top {
+            win.window.set_window_level(WindowLevel::AlwaysOnTop);
+        }
+        if d.start_fullscreen {
+            win.window.set_fullscreen(Some(Fullscreen::Borderless(mon.clone())));
+        }
         win.visible = true;
         win.window.request_redraw();
-        // Some WMs ignore the position while the window is unmapped: re-apply after mapping.
-        self.apply_dropdown_geometry(el, wid);
-    }
-
-    fn hide_dropdown(&mut self, wid: WindowId) {
-        if let Some(win) = self.windows.get_mut(&wid) {
-            win.window.set_visible(false);
-            win.visible = false;
+        if self.anim.is_none() {
+            // Some WMs ignore the position while the window is unmapped: re-apply after mapping.
+            self.apply_dropdown_geometry(el, wid);
+        }
+        let win = &self.windows[&wid];
+        if let (Some(x), Some(id)) = (&self.x11, crate::x11::window_id(&win.window)) {
+            x.apply(id, d.skip_taskbar, d.all_workspaces, d.always_on_top);
+            if d.grab_focus {
+                x.activate(id);
+            }
+        }
+        if d.grab_focus {
+            win.window.focus_window();
         }
     }
 
+    fn hide_dropdown(&mut self, wid: WindowId) {
+        self.pending_hide = None;
+        let Some(win) = self.windows.get_mut(&wid) else { return };
+        if self.cfg.dropdown.animation && win.visible && self.anim.is_none() {
+            if let (Ok(pos), Some(m)) = (win.window.outer_position(), win.window.current_monitor()) {
+                let size = win.window.outer_size();
+                let to = offscreen(&self.cfg.dropdown.animation_from, &m, pos, size);
+                self.anim = Some(Anim {
+                    wid,
+                    start: Instant::now(),
+                    dur: Duration::from_millis(self.cfg.dropdown.animation_duration_ms.max(1)),
+                    from: (pos.x, pos.y),
+                    to: (to.x, to.y),
+                    hide: true,
+                });
+                win.visible = false;
+                return;
+            }
+        }
+        win.window.set_visible(false);
+        win.visible = false;
+    }
+
+    /// Advance the slide animation; returns the next wake-up time while running.
+    fn step_anim(&mut self, el: &ActiveEventLoop) -> Option<Instant> {
+        let a = self.anim.as_ref()?;
+        let t = (a.start.elapsed().as_secs_f32() / a.dur.as_secs_f32()).min(1.0);
+        let e = 1.0 - (1.0 - t).powi(3); // ease-out cubic
+        let x = a.from.0 + ((a.to.0 - a.from.0) as f32 * e).round() as i32;
+        let y = a.from.1 + ((a.to.1 - a.from.1) as f32 * e).round() as i32;
+        let (wid, hide) = (a.wid, a.hide);
+        if let Some(w) = self.windows.get(&wid) {
+            w.window.set_outer_position(PhysicalPosition::new(x, y));
+        }
+        if t >= 1.0 {
+            self.anim = None;
+            if hide {
+                if let Some(w) = self.windows.get(&wid) {
+                    w.window.set_visible(false);
+                }
+            } else {
+                self.apply_dropdown_geometry(el, wid);
+            }
+            return None;
+        }
+        Some(Instant::now() + Duration::from_millis(8))
+    }
+
     fn toggle_dropdown(&mut self, el: &ActiveEventLoop) {
+        // Like tilda: ignore toggles closer than 150 ms (key repeat / double triggers).
+        if self.last_toggle.map(|t| t.elapsed() < Duration::from_millis(150)).unwrap_or(false) {
+            return;
+        }
+        self.last_toggle = Some(Instant::now());
         let wid = match self.dropdown_id() {
             Some(w) => w,
             None => {
@@ -770,17 +935,22 @@ impl App {
             }
         };
         let win = &self.windows[&wid];
+        // Pressing the global hotkey makes the WM grab the keyboard, so the dropdown loses
+        // focus right before our toggle arrives. Treat such a recent loss as "focused".
+        let lost_to_hotkey = win.unfocused_at.map(|t| t.elapsed() < Duration::from_millis(700)).unwrap_or(false);
         let recently_tried = self.focus_try.map(|t| t.elapsed() < Duration::from_secs(3)).unwrap_or(false);
+        let hide_unfocused = self.cfg.dropdown.unfocused_toggle == "hide";
         if !win.visible {
             self.focus_try = None;
             self.show_dropdown(el, wid);
-        } else if win.focused || recently_tried {
-            // Focused → hide. Also hide if a focus attempt just failed (WM focus-stealing
-            // prevention), so the hotkey never gets "stuck".
+        } else if win.focused || lost_to_hotkey || recently_tried || hide_unfocused {
             self.focus_try = None;
             self.hide_dropdown(wid);
         } else {
-            // Visible behind other windows: bring it to front first (guake behaviour).
+            // Visible behind other windows: bring it to the front first.
+            if let (Some(x), Some(id)) = (&self.x11, crate::x11::window_id(&win.window)) {
+                x.activate(id);
+            }
             win.window.focus_window();
             self.focus_try = Some(Instant::now());
         }
@@ -1184,7 +1354,7 @@ impl App {
             Action::ReloadConfig => {
                 self.cfg = Config::load();
                 self.bindings = Bindings::new(&self.cfg);
-                self.theme = Theme::from_config(&self.cfg.colors);
+                self.theme = Theme::from_config(&self.cfg);
                 for w in self.windows.values() {
                     w.window.request_redraw();
                 }
@@ -1195,8 +1365,138 @@ impl App {
                     self.dropdown_cycle_monitor(el, wid, if a == Action::DropdownNextMonitor { 1 } else { -1 });
                 }
             }
+            Action::ToggleTransparency => {
+                self.transparency_on = !self.transparency_on;
+                let op = self.cfg.effective_opacity(self.transparency_on);
+                for w in self.windows.values_mut() {
+                    w.renderer.set_opacity(op);
+                    w.window.request_redraw();
+                }
+            }
+            Action::Search => {
+                if let Some(id) = active {
+                    let win = self.windows.get_mut(&wid).unwrap();
+                    win.search = Some(SearchState { pane: id, query: String::new(), regex: None, current: None });
+                    win.window.request_redraw();
+                }
+            }
+            Action::Quit => self.request_close(el, wid, Confirm::Quit),
+            Action::QuitWithoutSaving => self.request_close(el, wid, Confirm::QuitNoSave),
+            Action::OpenSettings => {
+                let Ok(exe) = std::env::current_exe() else { return };
+                let at = self.windows.get(&wid).map(|w| w.active_tab + 1);
+                let id = self.alloc_id();
+                let tab = Tab { root: Node::Leaf(id), active: id, title: Some("⚙ Settings".into()), zoomed: false };
+                let win = self.windows.get_mut(&wid).unwrap();
+                let idx = at.unwrap_or(0).min(win.tabs.len());
+                win.tabs.insert(idx, tab);
+                win.active_tab = idx;
+                self.relayout(wid);
+                let r = self.windows[&wid].pane_rects.first().map(|x| x.1).unwrap_or_default();
+                let opts = SpawnOpts {
+                    cwd: None,
+                    command: None,
+                    restore: None,
+                    persist_id: None,
+                    title: Some("⚙ Settings".into()),
+                    program: Some((exe.display().to_string(), vec!["--settings".into()])),
+                    remote: None,
+                };
+                if !self.spawn_pane(wid, id, opts, r) {
+                    self.remove_leaf(wid, id);
+                }
+                self.after_structure_change(el, wid);
+            }
             Action::None => {}
         }
+    }
+
+    // ------------------------------------------------------------------ search
+
+    fn search_update(&mut self, wid: WindowId, from_bottom: bool, direction: alacritty_terminal::index::Direction) {
+        use alacritty_terminal::index::Direction;
+        use alacritty_terminal::term::search::RegexSearch;
+        let Some(win) = self.windows.get_mut(&wid) else { return };
+        let Some(st) = win.search.as_mut() else { return };
+        let Some(p) = self.panes.get(&st.pane) else { return };
+        if st.query.is_empty() {
+            st.regex = None;
+            st.current = None;
+            win.window.request_redraw();
+            return;
+        }
+        // smart case: case-insensitive unless the query has capitals
+        let pat = if st.query.chars().any(|c| c.is_uppercase()) {
+            regex::escape(&st.query)
+        } else {
+            format!("(?i){}", regex::escape(&st.query))
+        };
+        if st.regex.is_none() || from_bottom {
+            st.regex = RegexSearch::new(&pat).ok();
+        }
+        let Some(re) = st.regex.as_mut() else { return };
+        let mut term = p.term.lock();
+        let origin = if from_bottom || st.current.is_none() {
+            let g = term.grid();
+            Point::new(Line(g.screen_lines() as i32 - 1), Column(g.columns() - 1))
+        } else {
+            let m = st.current.clone().unwrap();
+            match direction {
+                Direction::Left => *m.start(),
+                Direction::Right => *m.end(),
+            }
+        };
+        let side = if direction == Direction::Left { Side::Left } else { Side::Right };
+        let found = term.search_next(re, origin, direction, side, None);
+        let found = match (found, &st.current) {
+            // stepping from a match returns the same match first; step once more
+            (Some(m), Some(cur)) if !from_bottom && m == *cur => {
+                let o = if direction == Direction::Left { *m.start() } else { *m.end() };
+                let o = if direction == Direction::Left {
+                    if o.column.0 > 0 { Point::new(o.line, o.column - 1) } else { Point::new(o.line - 1, Column(term.grid().columns() - 1)) }
+                } else {
+                    o
+                };
+                term.search_next(re, o, direction, side, None)
+            }
+            (f, _) => f,
+        };
+        if let Some(m) = &found {
+            term.scroll_to_point(*m.start());
+        }
+        st.current = found;
+        drop(term);
+        win.window.request_redraw();
+    }
+
+    /// Keys while the search bar is open. Returns true if consumed.
+    fn search_key(&mut self, wid: WindowId, ev: &KeyEvent) -> bool {
+        use alacritty_terminal::index::Direction;
+        let Some(win) = self.windows.get_mut(&wid) else { return false };
+        let Some(st) = win.search.as_mut() else { return false };
+        match &ev.logical_key {
+            Key::Named(NamedKey::Escape) => {
+                win.search = None;
+                win.window.request_redraw();
+            }
+            Key::Named(NamedKey::Enter) | Key::Named(NamedKey::ArrowUp) if !self.modifiers.shift_key() => {
+                self.search_update(wid, false, Direction::Left)
+            }
+            Key::Named(NamedKey::Enter) | Key::Named(NamedKey::ArrowDown) => self.search_update(wid, false, Direction::Right),
+            Key::Named(NamedKey::Backspace) => {
+                st.query.pop();
+                self.search_update(wid, true, Direction::Left);
+            }
+            _ => {
+                if self.modifiers.control_key() || self.modifiers.alt_key() {
+                    return false; // let bindings (e.g. paste) work
+                }
+                let Some(t) = &ev.text else { return true };
+                st.query.extend(t.chars().filter(|c| !c.is_control()));
+                self.search_update(wid, true, Direction::Left);
+            }
+        }
+        true
     }
 
     // ------------------------------------------------------------------ input
@@ -1207,7 +1507,7 @@ impl App {
             if let Some(p) = self.active_pane_id(wid).and_then(|id| self.panes.get(&id)) {
                 let mode = *p.term.lock().mode();
                 if mode.contains(TermMode::REPORT_EVENT_TYPES) {
-                    if let Some(b) = keys::encode_kitty(&ev, self.modifiers, mode, 3) {
+                    if let Some(b) = keys::encode_kitty(&ev, self.modifiers, mode, 3, &self.keycfg) {
                         p.write(b);
                     }
                 }
@@ -1219,6 +1519,11 @@ impl App {
         }
         // Close confirmation prompt
         if let Some(c) = self.windows.get(&wid).and_then(|w| w.confirm) {
+            if matches!(&ev.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("d")) && self.confirm_is_quit(c) {
+                self.windows.get_mut(&wid).unwrap().confirm = None;
+                self.quit(el, true);
+                return;
+            }
             let always = matches!(&ev.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("a"))
                 && matches!(c, Confirm::ClipRead(_));
             let yes = always
@@ -1273,6 +1578,10 @@ impl App {
             self.windows[&wid].window.request_redraw();
             return;
         }
+        if self.windows.get(&wid).map(|w| w.search.is_some()).unwrap_or(false) && self.search_key(wid, &ev) {
+            return;
+        }
+        self.last_input = Instant::now();
         if let Some(a) = self.bindings.lookup(&ev, self.modifiers) {
             self.do_action(el, wid, a);
             return;
@@ -1281,14 +1590,16 @@ impl App {
         let Some(p) = self.panes.get(&id) else { return };
         let mode = *p.term.lock().mode();
         let bytes = if mode.intersects(TermMode::KITTY_KEYBOARD_PROTOCOL) {
-            keys::encode_kitty(&ev, self.modifiers, mode, if ev.repeat { 2 } else { 1 })
+            keys::encode_kitty(&ev, self.modifiers, mode, if ev.repeat { 2 } else { 1 }, &self.keycfg)
         } else {
-            keys::encode(&ev, self.modifiers, mode)
+            keys::encode(&ev, self.modifiers, mode, &self.keycfg)
         };
         if let Some(bytes) = bytes {
             {
                 let mut t = p.term.lock();
-                t.scroll_display(Scroll::Bottom);
+                if self.cfg.scroll_on_key {
+                    t.scroll_display(Scroll::Bottom);
+                }
                 t.selection = None;
             }
             p.write(bytes);
@@ -1360,6 +1671,19 @@ impl App {
                 return;
             }
         }
+        // Scrollbar drag
+        if button == MouseButton::Left {
+            if !pressed && self.windows.get_mut(&wid).unwrap().scroll_drag.take().is_some() {
+                return;
+            }
+            if pressed {
+                if let Some((id, rect)) = self.scrollbar_hit(wid, x, y) {
+                    self.windows.get_mut(&wid).unwrap().scroll_drag = Some(id);
+                    self.scroll_to_y(wid, id, rect, y);
+                    return;
+                }
+            }
+        }
         let btn = match button {
             MouseButton::Left => 0,
             MouseButton::Middle => 1,
@@ -1382,7 +1706,7 @@ impl App {
         let (point, side, col, row) = self.cell_at(wid, id, rect, x, y);
 
         // Ctrl+click opens URLs / OSC 8 hyperlinks
-        if pressed && button == MouseButton::Left && self.modifiers.control_key() {
+        if pressed && button == MouseButton::Left && (self.modifiers.control_key() || !self.cfg.url_requires_ctrl) {
             if let Some((_, _, url)) = self.url_at(id, point) {
                 self.open_url(&url);
                 return;
@@ -1449,8 +1773,38 @@ impl App {
         }
     }
 
+    fn scrollbar_hit(&self, wid: WindowId, x: f64, y: f64) -> Option<(u64, Rect)> {
+        if self.cfg.scrollbar == "none" {
+            return None;
+        }
+        let win = &self.windows[&wid];
+        let zone = (8.0 * win.scale as f32).round();
+        let (id, r) = self.pane_at(wid, x, y)?;
+        let x = x as f32;
+        let inside = if self.cfg.scrollbar == "left" { x < r.x + zone } else { x > r.x + r.w - zone };
+        let has_hist = self.panes.get(&id).map(|p| p.term.lock().grid().history_size() > 0).unwrap_or(false);
+        (inside && has_hist).then_some((id, r))
+    }
+
+    fn scroll_to_y(&self, wid: WindowId, id: u64, r: Rect, y: f64) {
+        let Some(p) = self.panes.get(&id) else { return };
+        let mut t = p.term.lock();
+        let hist = t.grid().history_size();
+        let frac = ((y as f32 - r.y) / r.h).clamp(0.0, 1.0);
+        let target = ((1.0 - frac) * hist as f32).round() as i32;
+        let cur = t.grid().display_offset() as i32;
+        t.scroll_display(Scroll::Delta(target - cur));
+        self.windows[&wid].window.request_redraw();
+    }
+
     fn on_cursor_moved(&mut self, wid: WindowId, x: f64, y: f64) {
         self.windows.get_mut(&wid).unwrap().cursor = (x, y);
+        if let Some(id) = self.windows[&wid].scroll_drag {
+            if let Some(r) = self.windows[&wid].pane_rects.iter().find(|(i, _)| *i == id).map(|x| x.1) {
+                self.scroll_to_y(wid, id, r, y);
+            }
+            return;
+        }
         self.update_hover(wid);
         let win = self.windows.get_mut(&wid).unwrap();
         let reporting = win.reporting_button;
@@ -1517,13 +1871,17 @@ impl App {
     // ------------------------------------------------------------------ rendering
 
     fn render(&mut self, wid: WindowId) {
+        let last_input = self.last_input;
+        let tab_bar_h = self.windows.get(&wid).map(|w| self.tab_bar_height(w)).unwrap_or(0.0);
         let confirm_text = self.windows.get(&wid).and_then(|w| w.confirm).map(|c| {
             let hint = if matches!(c, Confirm::ClipRead(_)) {
                 "[y] allow once   [a] always   [n] deny"
+            } else if self.confirm_is_quit(c) {
+                "[y/Enter] quit   [d] quit without saving   [n/Esc] cancel"
             } else {
                 "[y/Enter] yes   [n/Esc] no"
             };
-            format!("{}   {hint}", self.confirm_text(wid, c))
+            (self.confirm_text(wid, c), hint.to_string())
         });
         let App { windows, panes, fonts, gpu, theme, cfg, .. } = self;
         let Some(gpu) = gpu.as_ref() else { return };
@@ -1561,12 +1919,33 @@ impl App {
                 win.renderer.rect(r.x, r.y, r.w, r.h, rgba(bg_default, 1.0));
             }
             let hover = win.hover_url.as_ref().filter(|h| h.0 == *id).map(|h| (h.1, h.2, h.3));
+            let blink_off = cfg.cursor_blink && win.focused && (last_input.elapsed().as_millis() / 530) % 2 == 1;
             let term = pane.term.lock();
             let content = term.renderable_content();
             let colors = content.colors;
             let offset = content.display_offset as i32;
             let selection = content.selection;
             let cursor = content.cursor;
+            // visible search matches
+            let mut matches: Vec<alacritty_terminal::term::search::Match> = Vec::new();
+            let mut current_match = None;
+            if let Some(st) = win.search.as_mut().filter(|s| s.pane == *id) {
+                current_match = st.current.clone();
+                if let Some(re) = st.regex.as_mut() {
+                    let g = term.grid();
+                    let start = Point::new(Line(-offset), Column(0));
+                    let end = Point::new(Line(g.screen_lines() as i32 - 1 - offset), Column(g.columns() - 1));
+                    matches = alacritty_terminal::term::search::RegexIter::new(
+                        start,
+                        end,
+                        alacritty_terminal::index::Direction::Right,
+                        &term,
+                        re,
+                    )
+                    .take(500)
+                    .collect();
+                }
+            }
             let ox = r.x + pad;
             let oy = r.y + pad;
             let mut row_buf: Vec<RCell> = Vec::with_capacity(pane.cols);
@@ -1585,7 +1964,14 @@ impl App {
                 }
                 let x = ox + col as f32 * m.width;
                 let y = oy + row as f32 * m.height;
-                let mut fg = resolve(cell.fg, colors, theme);
+                let fg_color = match cell.fg {
+                    Color::Named(n) if cfg.bold_is_bright && cell.flags.contains(Flags::BOLD) && (n as usize) < 8 => {
+                        Color::Indexed(n as u8 + 8)
+                    }
+                    Color::Indexed(i) if cfg.bold_is_bright && cell.flags.contains(Flags::BOLD) && i < 8 => Color::Indexed(i + 8),
+                    c => c,
+                };
+                let mut fg = resolve(fg_color, colors, theme);
                 let mut bg = resolve(cell.bg, colors, theme);
                 let mut bg_set = !matches!(cell.bg, Color::Named(NamedColor::Background));
                 if cell.flags.contains(Flags::DIM) {
@@ -1598,6 +1984,11 @@ impl App {
                 if selection.map(|s| s.contains(ind.point)).unwrap_or(false) {
                     fg = theme.sel_fg;
                     bg = theme.sel_bg;
+                    bg_set = true;
+                } else if !matches.is_empty() && matches.iter().any(|m| m.contains(&ind.point)) {
+                    let cur = current_match.as_ref().map(|m| m.contains(&ind.point)).unwrap_or(false);
+                    bg = if cur { theme.sel_bg } else { theme.search_match };
+                    fg = theme.table[257];
                     bg_set = true;
                 }
                 if cell.flags.contains(Flags::HIDDEN) {
@@ -1637,7 +2028,7 @@ impl App {
             draw_row(&mut win.renderer, gpu, fonts, &row_buf, ox, oy + cur_row as f32 * m.height, cfg.ligatures);
             // Cursor
             let crow = cursor.point.line.0 + offset;
-            if cursor.shape != CursorShape::Hidden && crow >= 0 && (crow as usize) < pane.rows {
+            if cursor.shape != CursorShape::Hidden && !blink_off && crow >= 0 && (crow as usize) < pane.rows {
                 let x = ox + cursor.point.column.0 as f32 * m.width;
                 let y = oy + crow as f32 * m.height;
                 let cell = &term.grid()[cursor.point];
@@ -1681,6 +2072,26 @@ impl App {
             }
         }
 
+        // Scrollbars
+        if cfg.scrollbar != "none" {
+            let sw = (4.0 * win.scale as f32).round().max(3.0);
+            for (id, r) in &rects {
+                let Some(pane) = panes.get(id) else { continue };
+                let t = pane.term.lock();
+                let hist = t.grid().history_size();
+                if hist == 0 {
+                    continue;
+                }
+                let off = t.grid().display_offset();
+                let total = (hist + pane.rows) as f32;
+                let th = (r.h * pane.rows as f32 / total).max(16.0).min(r.h);
+                let ty = r.y + (r.h - th) * (1.0 - off as f32 / hist as f32);
+                let x = if cfg.scrollbar == "left" { r.x } else { r.x + r.w - sw };
+                win.renderer.rect_top(x, r.y, sw, r.h, rgba(theme.inactive_border, 0.35));
+                win.renderer.rect_top(x, ty, sw, th, rgba(theme.active_border, 0.8));
+            }
+        }
+
         // IME: position the candidate window and draw the preedit text at the cursor
         if let Some((cx, cy)) = cursor_px {
             let area = (cx as i32, cy as i32);
@@ -1700,13 +2111,21 @@ impl App {
         }
 
         // Tab bar
-        let tb_h = if win.tabs.len() >= cfg.tab_bar_min_tabs.max(1) { (m.height + 6.0 * win.scale as f32).round() } else { 0.0 };
+        let tb_h = tab_bar_h;
+        let (_, wh_all) = win.renderer.size();
+        let bar_y = if cfg.tab_bar_position == "bottom" { wh_all - tb_h } else { 0.0 };
         win.tab_rects.clear();
         let mut titles: Vec<String> = Vec::new();
         for (i, t) in win.tabs.iter().enumerate() {
             let base = match &t.title {
                 Some(s) => s.clone(),
-                None => panes.get_mut(&t.active).map(|p| p.display_title()).unwrap_or_default(),
+                None => panes
+                    .get_mut(&t.active)
+                    .map(|p| {
+                        let fallback = p.fallback_title();
+                        format_title(cfg, &p.title, &fallback)
+                    })
+                    .unwrap_or_default(),
             };
             let base = if win.rename.is_some() && i == active_tab {
                 format!("✎ {}▏", win.rename.as_ref().unwrap())
@@ -1719,9 +2138,9 @@ impl App {
             titles.push(format!("{}: {}{}{}", i + 1, base, count, z));
         }
         if tb_h > 0.0 {
-            win.renderer.rect(0.0, 0.0, ww, tb_h, rgba(theme.tab_bar_bg, 1.0));
+            win.renderer.rect(0.0, bar_y, ww, tb_h, rgba(theme.tab_bar_bg, 1.0));
             let n = win.tabs.len().max(1) as f32;
-            let tw = (ww / n).min(m.width * 32.0).floor();
+            let tw = if cfg.tab_bar_expand { (ww / n).floor() } else { (ww / n).min(m.width * 32.0).floor() };
             for (i, title) in titles.iter().enumerate() {
                 let x = i as f32 * tw;
                 let (fg, bg) = if i == active_tab {
@@ -1729,10 +2148,10 @@ impl App {
                 } else {
                     (theme.tab_inactive_fg, theme.tab_inactive_bg)
                 };
-                win.renderer.rect(x, 0.0, tw - 1.0, tb_h, rgba(bg, 1.0));
-                let ty = ((tb_h - m.height) / 2.0).round();
+                win.renderer.rect(x, bar_y, tw - 1.0, tb_h, rgba(bg, 1.0));
+                let ty = bar_y + ((tb_h - m.height) / 2.0).round();
                 win.renderer.text(gpu, fonts, title, x + m.width, ty, tw - 2.0 * m.width, rgba(fg, 1.0));
-                win.tab_rects.push((i, Rect { x, y: 0.0, w: tw, h: tb_h }));
+                win.tab_rects.push((i, Rect { x, y: bar_y, w: tw, h: tb_h }));
             }
         } else if win.rename.is_some() {
             // Rename prompt without a tab bar: draw an overlay line on top
@@ -1751,17 +2170,48 @@ impl App {
             }
         }
         // Close confirmation overlay
-        if let Some(text) = confirm_text {
+        if let Some((line, hint)) = confirm_text {
             let (_, wh) = win.renderer.size();
-            let line = text;
-            let tw = (line.chars().count() as f32 + 4.0) * m.width;
+            let tw = (line.chars().count().max(hint.chars().count()) as f32 + 4.0) * m.width;
             let bw = tw.min(ww);
-            let bh = m.height * 3.0;
+            let bh = m.height * 4.0;
             let bx = ((ww - bw) / 2.0).max(0.0);
             let by = ((wh - bh) / 2.0).max(0.0);
             win.renderer.rect_top(bx - 2.0, by - 2.0, bw + 4.0, bh + 4.0, rgba(theme.active_border, 1.0));
             win.renderer.rect_top(bx, by, bw, bh, rgba(theme.tab_bar_bg, 1.0));
             win.renderer.text(gpu, fonts, &line, bx + 2.0 * m.width, by + m.height, bw - 2.0 * m.width, rgba(theme.table[256], 1.0));
+            win.renderer.text(gpu, fonts, &hint, bx + 2.0 * m.width, by + m.height * 2.0, bw - 2.0 * m.width, rgba(theme.active_border, 1.0));
+        }
+        // Search bar
+        if let Some(st) = &win.search {
+            let (_, wh) = win.renderer.size();
+            let bh = m.height + 6.0;
+            let by = if cfg.tab_bar_position == "bottom" { wh - tb_h - bh } else { wh - bh };
+            win.renderer.rect_top(0.0, by, ww, bh, rgba(theme.tab_bar_bg, 1.0));
+            win.renderer.rect_top(0.0, by, ww, 1.0, rgba(theme.active_border, 1.0));
+            let status = if st.query.is_empty() {
+                ""
+            } else if st.current.is_none() {
+                "   (no match)"
+            } else {
+                ""
+            };
+            let text = format!("Search: {}▏{status}", st.query);
+            win.renderer.text(gpu, fonts, &text, m.width, by + 3.0, ww * 0.6, rgba(theme.table[256], 1.0));
+            let hint = "Enter/↑ older  Shift+Enter/↓ newer  Esc close";
+            let hw = hint.chars().count() as f32 * m.width;
+            if hw < ww * 0.4 {
+                win.renderer.text(gpu, fonts, hint, ww - hw - m.width, by + 3.0, hw + m.width, rgba(theme.inactive_border, 1.0));
+            }
+        }
+        // Visual bell
+        if let Some(t) = win.bell_at {
+            if t.elapsed() < Duration::from_millis(150) {
+                let (_, wh) = win.renderer.size();
+                win.renderer.rect_top(0.0, 0.0, ww, wh, rgba(theme.table[256], 0.12));
+            } else {
+                win.bell_at = None;
+            }
         }
         // Toast (bottom right)
         if let Some((msg, t)) = win.toast.clone() {
@@ -1785,6 +2235,12 @@ impl App {
             TermEvent::Wakeup => {
                 if let Some(p) = self.panes.get_mut(&id) {
                     p.dirty = true;
+                    if self.cfg.scroll_on_output {
+                        let mut t = p.term.lock();
+                        if t.grid().display_offset() > 0 {
+                            t.scroll_display(Scroll::Bottom);
+                        }
+                    }
                 }
                 if let Some(w) = wid.and_then(|w| self.windows.get(&w)) {
                     if w.pane_rects.iter().any(|(i, _)| *i == id) {
@@ -1863,6 +2319,22 @@ impl App {
                 }
             }
             TermEvent::Bell => {
+                if !self.cfg.bell {
+                    return;
+                }
+                if self.cfg.visual_bell {
+                    if let Some(w) = wid.and_then(|w| self.windows.get_mut(&w)) {
+                        w.bell_at = Some(Instant::now());
+                        w.window.request_redraw();
+                    }
+                    if let Some(w) = wid {
+                        let proxy = self.proxy.clone();
+                        std::thread::spawn(move || {
+                            std::thread::sleep(Duration::from_millis(160));
+                            let _ = proxy.send_event(UserEvent::Redraw(w));
+                        });
+                    }
+                }
                 if let Some(w) = wid.and_then(|w| self.windows.get(&w)) {
                     if !w.focused {
                         w.window.request_user_attention(Some(winit::window::UserAttentionType::Informational));
@@ -1932,30 +2404,152 @@ impl App {
             log::info!("Wayland session: use `dtem --install-gnome-shortcut` (or bind `dtem --toggle`) for the hotkey");
             return;
         }
-        let hk: global_hotkey::hotkey::HotKey = match crate::hotkey_from_config(&self.cfg.dropdown.hotkey) {
-            Some(h) => h,
-            None => {
-                log::error!("invalid dropdown hotkey {:?}", self.cfg.dropdown.hotkey);
+        if self.hotkey.is_none() {
+            match global_hotkey::GlobalHotKeyManager::new() {
+                Ok(m) => {
+                    let proxy = self.proxy.clone();
+                    global_hotkey::GlobalHotKeyEvent::set_event_handler(Some(move |e: global_hotkey::GlobalHotKeyEvent| {
+                        if e.state == global_hotkey::HotKeyState::Pressed {
+                            let _ = proxy.send_event(UserEvent::Command("toggle".into()));
+                        }
+                    }));
+                    self.hotkey = Some(m);
+                }
+                Err(e) => {
+                    log::warn!("global hotkey unavailable: {e}");
+                    return;
+                }
+            }
+        }
+        let m = self.hotkey.as_ref().unwrap();
+        for k in self.installed_hotkeys.drain(..) {
+            if let Some(h) = crate::hotkey_from_config(&k) {
+                let _ = m.unregister(h);
+            }
+        }
+        // Keys already handled by a GNOME shortcut must not be grabbed twice.
+        let gnome: Vec<String> = crate::gnome_dtem_accels();
+        for k in self.cfg.dropdown.hotkey.list() {
+            if gnome.iter().any(|g| g.eq_ignore_ascii_case(&crate::gnome_accel(&k))) {
+                continue;
+            }
+            match crate::hotkey_from_config(&k) {
+                Some(h) => match m.register(h) {
+                    Ok(_) => self.installed_hotkeys.push(k),
+                    Err(e) => log::warn!("cannot grab hotkey {k}: {e}"),
+                },
+                None => log::error!("invalid dropdown hotkey {k:?}"),
+            }
+        }
+    }
+
+    /// Apply a changed dtem.toml to the running instance.
+    fn apply_config(&mut self, el: &ActiveEventLoop) {
+        let new = match Config::try_load() {
+            Ok(c) => c,
+            Err(e) => {
+                for w in self.order.clone() {
+                    self.toast(w, e.clone());
+                }
                 return;
             }
         };
-        match global_hotkey::GlobalHotKeyManager::new() {
-            Ok(m) => {
-                if let Err(e) = m.register(hk) {
-                    log::warn!("cannot grab hotkey {} (already used by the desktop shortcut?): {e}", self.cfg.dropdown.hotkey);
-                }
-                let proxy = self.proxy.clone();
-                let id = hk.id();
-                global_hotkey::GlobalHotKeyEvent::set_event_handler(Some(move |e: global_hotkey::GlobalHotKeyEvent| {
-                    if e.id == id && e.state == global_hotkey::HotKeyState::Pressed {
-                        let _ = proxy.send_event(UserEvent::Command("toggle".into()));
-                    }
-                }));
-                self.hotkey = Some(m);
+        let old = std::mem::replace(&mut self.cfg, new);
+        self.bindings = Bindings::new(&self.cfg);
+        self.theme = Theme::from_config(&self.cfg);
+        self.keycfg = keys::KeyCfg::from_config(&self.cfg);
+        self.url_re = build_url_regex(&self.cfg);
+        if old.transparency != self.cfg.transparency {
+            self.transparency_on = self.cfg.transparency;
+        }
+        if old.font_family != self.cfg.font_family {
+            match FontSet::new(&self.cfg.font_family) {
+                Ok(f) => self.fonts = f,
+                Err(e) => log::error!("font: {e}"),
             }
-            Err(e) => log::warn!("global hotkey unavailable: {e}"),
+        }
+        let font_changed = old.font_family != self.cfg.font_family
+            || old.font_size != self.cfg.font_size
+            || old.line_height != self.cfg.line_height;
+        let op = self.cfg.effective_opacity(self.transparency_on);
+        for wid in self.order.clone() {
+            let Some(w) = self.windows.get_mut(&wid) else { continue };
+            w.renderer.set_opacity(op);
+            if font_changed {
+                if old.font_size != self.cfg.font_size {
+                    w.font_size = self.cfg.font_size;
+                }
+                let fs = w.font_size;
+                self.set_font_size(wid, fs);
+            }
+            self.relayout(wid);
+            if self.windows[&wid].dropdown && self.windows[&wid].visible && self.anim.is_none() {
+                self.apply_dropdown_geometry(el, wid);
+                let d = self.cfg.dropdown.clone();
+                let w = &self.windows[&wid];
+                w.window.set_window_level(if d.always_on_top { WindowLevel::AlwaysOnTop } else { WindowLevel::Normal });
+                if let (Some(x), Some(id)) = (&self.x11, crate::x11::window_id(&w.window)) {
+                    x.apply(id, d.skip_taskbar, d.all_workspaces, d.always_on_top);
+                }
+            }
+        }
+        if self.role == Role::Dropdown && old.dropdown.hotkey != self.cfg.dropdown.hotkey {
+            if !crate::gnome_dtem_accels().is_empty() {
+                if let Err(e) = crate::install_gnome_shortcut(&self.cfg, true) {
+                    log::warn!("GNOME shortcut update failed: {e}");
+                }
+            }
+            self.register_hotkey();
+        }
+        for w in self.windows.values() {
+            w.window.request_redraw();
         }
     }
+}
+
+struct Anim {
+    wid: WindowId,
+    start: Instant,
+    dur: Duration,
+    from: (i32, i32),
+    to: (i32, i32),
+    hide: bool,
+}
+
+/// Position just outside the monitor edge the dropdown slides from.
+fn offscreen(from: &str, m: &MonitorHandle, pos: PhysicalPosition<i32>, size: PhysicalSize<u32>) -> PhysicalPosition<i32> {
+    let (mp, ms) = (m.position(), m.size());
+    match from {
+        "bottom" => PhysicalPosition::new(pos.x, mp.y + ms.height as i32),
+        "left" => PhysicalPosition::new(mp.x - size.width as i32, pos.y),
+        "right" => PhysicalPosition::new(mp.x + ms.width as i32, pos.y),
+        _ => PhysicalPosition::new(pos.x, mp.y - size.height as i32),
+    }
+}
+
+fn build_url_regex(cfg: &Config) -> regex::Regex {
+    let mut parts = Vec::new();
+    if cfg.match_web_uris {
+        parts.push(r#"(?:https?|ftp)://[^\s<>"'`{}|\\^]+"#.to_string());
+        parts.push(r#"www\.[^\s<>"'`{}|\\^]+"#.to_string());
+    }
+    if cfg.match_file_uris {
+        parts.push(r#"file://[^\s<>"'`{}|\\^]+"#.to_string());
+    }
+    if cfg.match_email {
+        parts.push(r#"(?:mailto:)?[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+"#.to_string());
+    }
+    if parts.is_empty() {
+        parts.push("$^".into());
+    }
+    regex::Regex::new(&parts.join("|")).unwrap()
+}
+
+struct SearchState {
+    pane: u64,
+    query: String,
+    regex: Option<alacritty_terminal::term::search::RegexSearch>,
+    current: Option<alacritty_terminal::term::search::Match>,
 }
 
 /// One visible cell of a row, waiting to be drawn.
@@ -2014,6 +2608,28 @@ fn draw_row(r: &mut Renderer, gpu: &Gpu, fonts: &mut FontSet, cells: &[RCell], o
     }
 }
 
+/// Tab title from the program-set title and the cwd fallback (tilda's d_set_title & title_behaviour).
+fn format_title(cfg: &Config, program: &str, fallback: &str) -> String {
+    let base = if cfg.title.is_empty() { fallback } else { cfg.title.as_str() };
+    let t = match (cfg.dynamic_title.as_str(), program.is_empty()) {
+        ("none", _) => base.to_string(),
+        ("before", false) => format!("{program} - {base}"),
+        ("after", false) => format!("{base} - {program}"),
+        (_, false) => program.to_string(),
+        (_, true) => fallback.to_string(),
+    };
+    let n = cfg.title_max_length;
+    let len = t.chars().count();
+    if n == 0 || len <= n {
+        return t;
+    }
+    match cfg.title_truncate.as_str() {
+        "start" => format!("…{}", t.chars().skip(len - n).collect::<String>()),
+        "none" => t,
+        _ => format!("{}…", t.chars().take(n).collect::<String>()),
+    }
+}
+
 fn expand_tilde(s: &str) -> PathBuf {
     if let Some(rest) = s.strip_prefix("~") {
         if let Some(h) = dirs::home_dir() {
@@ -2055,6 +2671,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::InsertText(pane, text) => self.paste_into(pane, &text),
             UserEvent::Toast(pane, msg) => self.toast_pane(pane, msg),
             UserEvent::RemoteFile(pane, name, data) => self.on_remote_file(pane, name, data),
+            UserEvent::ConfigChanged => self.apply_config(el),
             UserEvent::Redraw(w) => {
                 if let Some(w) = self.windows.get(&w) {
                     w.window.request_redraw();
@@ -2080,11 +2697,8 @@ impl ApplicationHandler<UserEvent> for App {
                             self.windows[&w].window.focus_window();
                         }
                     }
-                    "quit" => {
-                        self.save_session(true);
-                        self.exiting = true;
-                        el.exit();
-                    }
+                    "quit" => self.quit(el, false),
+                    "quit-nosave" => self.quit(el, true),
                     _ => {
                         if let Some(p) = c.strip_prefix("session ") {
                             self.open_session_file(el, std::path::Path::new(p));
@@ -2150,6 +2764,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 let win = self.windows.get_mut(&wid).unwrap();
                 win.focused = f;
+                win.unfocused_at = if f { None } else { Some(Instant::now()) };
                 win.window.request_redraw();
                 let dropdown = win.dropdown;
                 if let Some(id) = self.active_pane_id(wid) {
@@ -2159,8 +2774,25 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 }
-                if dropdown && !f && self.cfg.dropdown.hide_on_focus_loss {
-                    self.hide_dropdown(wid);
+                if dropdown {
+                    if f {
+                        self.pending_hide = None;
+                    } else if self.cfg.dropdown.hide_on_focus_loss && self.windows[&wid].visible {
+                        self.pending_hide =
+                            Some((wid, Instant::now() + Duration::from_millis(self.cfg.dropdown.auto_hide_delay_ms)));
+                    }
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                let w = &self.windows[&wid];
+                if w.dropdown && w.visible && self.cfg.dropdown.hide_on_mouse_leave {
+                    self.pending_hide =
+                        Some((wid, Instant::now() + Duration::from_millis(self.cfg.dropdown.auto_hide_delay_ms)));
+                }
+            }
+            WindowEvent::CursorEntered { .. } => {
+                if self.pending_hide.map(|(w, _)| w == wid).unwrap_or(false) && !self.cfg.dropdown.hide_on_focus_loss {
+                    self.pending_hide = None;
                 }
             }
             WindowEvent::ModifiersChanged(m) => {
@@ -2212,11 +2844,36 @@ impl ApplicationHandler<UserEvent> for App {
         if self.last_save.elapsed() >= interval {
             self.save_session(false);
         }
-        el.set_control_flow(ControlFlow::WaitUntil(self.last_save + interval));
+        let mut next = self.last_save + interval;
+        if let Some(t) = self.step_anim(el) {
+            next = next.min(t);
+        }
+        if let Some((w, at)) = self.pending_hide {
+            if Instant::now() >= at {
+                self.pending_hide = None;
+                let still_unfocused = self.windows.get(&w).map(|x| !x.focused || self.cfg.dropdown.hide_on_mouse_leave).unwrap_or(false);
+                if still_unfocused {
+                    self.hide_dropdown(w);
+                }
+            } else {
+                next = next.min(at);
+            }
+        }
+        // Cursor blink: redraw focused windows on the blink period
+        if self.cfg.cursor_blink {
+            const PERIOD: u128 = 530;
+            let ms = self.last_input.elapsed().as_millis();
+            let wait = PERIOD - ms % PERIOD;
+            next = next.min(Instant::now() + Duration::from_millis(wait as u64));
+            for w in self.windows.values().filter(|w| w.focused && w.visible) {
+                w.window.request_redraw();
+            }
+        }
+        el.set_control_flow(ControlFlow::WaitUntil(next));
     }
 
     fn exiting(&mut self, _el: &ActiveEventLoop) {
-        if !self.exiting {
+        if !self.exiting && !self.discard_session {
             self.save_session(true);
         }
     }
@@ -2510,7 +3167,13 @@ impl App {
             }
             let (a, b) = (col_of[m.start()], col_of[m.start() + url.len() - 1]);
             if (a..=b).contains(&point.column.0) {
-                let url = if url.starts_with("www.") { format!("https://{url}") } else { url.to_string() };
+                let url = if url.starts_with("www.") {
+                    format!("https://{url}")
+                } else if url.contains('@') && !url.contains("://") && !url.starts_with("mailto:") {
+                    format!("mailto:{url}")
+                } else {
+                    url.to_string()
+                };
                 return Some((a, b, url));
             }
         }
@@ -2521,7 +3184,7 @@ impl App {
         let Some(win) = self.windows.get(&wid) else { return };
         let (x, y) = win.cursor;
         let mut hover = None;
-        if self.modifiers.control_key() {
+        if self.modifiers.control_key() || !self.cfg.url_requires_ctrl {
             if let Some((id, rect)) = self.pane_at(wid, x, y) {
                 let (point, _, _, _) = self.cell_at(wid, id, rect, x, y);
                 hover = self.url_at(id, point).map(|(a, b, u)| (id, point.line.0, a, b, u));

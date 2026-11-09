@@ -19,6 +19,18 @@ GPU-accelerated terminal emulator. It runs as a normal window or as a dropdown, 
 - **Transparency:** background opacity is configurable (needs a compositor).
 - **`dtem --remote`:** SSH with clipboard and file sync (see below).
 
+## Coming from tilda
+
+```
+dtem --import-tilda              # reads ~/.config/tilda/config_0 (or pass a file)
+```
+
+The importer converts every tilda option: hotkey, size/position/centering, monitor, slide animation, auto-hide, the unfocused-hotkey behaviour, always-on-top, sticky, taskbar, transparency, colors and palette, cursor, bold-is-bright, bell, scrollback, word chars, backspace/delete codes, command/login shell/working dir, title options, tab bar options, link matching, confirmations, and all key bindings. Your previous config is backed up first. A few options have no counterpart in dtem (tooltips, notebook border, set-as-desktop); the importer lists them.
+
+## Settings page
+
+Open it with `kitty_mod+F2` or `ctrl+,` (it opens in a new tab), or run `dtem --settings`. All options are grouped there: appearance, colors, dropdown, behavior, shell & titles, session and key bindings. Changes are saved to `dtem.toml` with comments preserved, and running instances apply them live (config hot-reload).
+
 ## Usage
 
 ```
@@ -29,7 +41,9 @@ dtem --session FILE.json      open a layout file
 dtem --remote [ssh args] HOST ssh in a new tab with clipboard/file sync
 dtem --no-restore             start fresh
 dtem --install-gnome-shortcut register the dropdown hotkey in GNOME
-dtem --quit [--dropdown]      quit the running instance (session saved)
+dtem --quit [--dropdown] [--no-save]  quit (--no-save: forget the session)
+dtem --settings               settings page
+dtem --import-tilda [FILE]    import a tilda config
 ```
 
 Install: `./install.sh --shortcut`
@@ -59,7 +73,7 @@ Opens an ssh session in a new tab. The session is multiplexed through an SSH Con
 
 ## Dropdown and monitors
 
-- Under X11, the hotkey (default `F12`) is grabbed globally. Under GNOME, both X11 and Wayland, run `dtem --install-gnome-shortcut` instead. It registers `dtem --toggle` as a custom shortcut.
+- Under X11, the hotkey (default `F12`; several keys allowed, e.g. `["F1", "ctrl+alt+t"]`) is grabbed globally. Keys that already have a GNOME shortcut are not grabbed a second time. Under GNOME, both X11 and Wayland, run `dtem --install-gnome-shortcut` instead. It registers `dtem --toggle` as a custom shortcut.
 - The dropdown always appears on the monitor you last moved it to. To move it, either:
   - use `kitty_mod+alt+m` (next monitor), or
   - use GNOME's `Super+Shift+←/→`.
@@ -88,7 +102,7 @@ Opens an ssh session in a new tab. The session is multiplexed through an SSH Con
 | pane N | `kitty_mod+1..9` |
 | focus neighbour | `kitty_mod+alt+h/j/k/l` |
 | resize pane | `kitty_mod+alt+arrows` |
-| move pane | `kitty_mod+f` / `kitty_mod+b` |
+| move pane | `kitty_mod+alt+f` / `kitty_mod+alt+b` |
 | zoom pane | `kitty_mod+l` |
 | copy / paste / paste selection | `kitty_mod+c` / `kitty_mod+v` / `shift+insert` |
 | open URL | `ctrl+click` |
@@ -98,6 +112,10 @@ Opens an ssh session in a new tab. The session is multiplexed through an SSH Con
 | new OS window | `kitty_mod+n` |
 | fullscreen | `kitty_mod+f11` |
 | export layout to `~/.config/dtem/sessions/` | `kitty_mod+alt+s` |
+| search in scrollback | `kitty_mod+f` |
+| settings page | `kitty_mod+f2`, `ctrl+,` |
+| quit (asks; `d` = quit without saving) | `kitty_mod+alt+q` |
+| transparency on/off | `toggle_transparency` (unbound by default) |
 | reload config | `kitty_mod+f5` |
 | dropdown → next monitor | `kitty_mod+alt+m` |
 

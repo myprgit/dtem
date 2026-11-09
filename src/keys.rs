@@ -49,6 +49,11 @@ pub enum Action {
     ToggleDropdown,
     DropdownNextMonitor,
     DropdownPrevMonitor,
+    ToggleTransparency,
+    Search,
+    Quit,
+    QuitWithoutSaving,
+    OpenSettings,
     None,
 }
 
@@ -109,6 +114,11 @@ impl Action {
             "toggle_dropdown" => Action::ToggleDropdown,
             "dropdown_next_monitor" => Action::DropdownNextMonitor,
             "dropdown_prev_monitor" => Action::DropdownPrevMonitor,
+            "toggle_transparency" => Action::ToggleTransparency,
+            "search" | "toggle_searchbar" => Action::Search,
+            "quit" => Action::Quit,
+            "quit_without_saving" => Action::QuitWithoutSaving,
+            "open_settings" | "edit_config_file" => Action::OpenSettings,
             "none" | "no_op" => Action::None,
             _ => return None,
         })
@@ -135,6 +145,7 @@ const DEFAULTS: &[(&str, &str)] = &[
     ("alt+7", "goto_tab_7"),
     ("alt+8", "goto_tab_8"),
     ("alt+9", "goto_tab_9"),
+    ("alt+0", "goto_tab_10"),
     // windows (panes)
     ("kitty_mod+enter", "new_window"),
     ("f5", "hsplit"),
@@ -143,8 +154,9 @@ const DEFAULTS: &[(&str, &str)] = &[
     ("kitty_mod+w", "close_window"),
     ("kitty_mod+bracketright", "next_window"),
     ("kitty_mod+bracketleft", "previous_window"),
-    ("kitty_mod+f", "move_window_forward"),
-    ("kitty_mod+b", "move_window_backward"),
+    ("kitty_mod+alt+f", "move_window_forward"),
+    ("kitty_mod+alt+b", "move_window_backward"),
+    ("kitty_mod+f", "search"),
     ("kitty_mod+1", "nth_window_1"),
     ("kitty_mod+2", "nth_window_2"),
     ("kitty_mod+3", "nth_window_3"),
@@ -190,7 +202,114 @@ const DEFAULTS: &[(&str, &str)] = &[
     ("kitty_mod+alt+s", "save_session"),
     ("kitty_mod+f5", "reload_config"),
     ("kitty_mod+alt+m", "dropdown_next_monitor"),
+    ("kitty_mod+f2", "open_settings"),
+    ("ctrl+comma", "open_settings"),
+    ("kitty_mod+alt+q", "quit"),
 ];
+
+/// Every bindable action with a short description (used by the settings page).
+pub const ACTIONS: &[(&str, &str)] = &[
+    ("new_tab", "New tab"),
+    ("close_tab", "Close tab"),
+    ("next_tab", "Next tab"),
+    ("previous_tab", "Previous tab"),
+    ("move_tab_forward", "Move tab right"),
+    ("move_tab_backward", "Move tab left"),
+    ("set_tab_title", "Rename tab"),
+    ("goto_tab_1", "Go to tab 1"),
+    ("goto_tab_2", "Go to tab 2"),
+    ("goto_tab_3", "Go to tab 3"),
+    ("goto_tab_4", "Go to tab 4"),
+    ("goto_tab_5", "Go to tab 5"),
+    ("goto_tab_6", "Go to tab 6"),
+    ("goto_tab_7", "Go to tab 7"),
+    ("goto_tab_8", "Go to tab 8"),
+    ("goto_tab_9", "Go to tab 9"),
+    ("goto_tab_10", "Go to tab 10"),
+    ("new_window", "Split (longer side)"),
+    ("hsplit", "Split horizontally"),
+    ("vsplit", "Split vertically"),
+    ("rotate_split", "Rotate split"),
+    ("close_window", "Close pane"),
+    ("next_window", "Next pane"),
+    ("previous_window", "Previous pane"),
+    ("move_window_forward", "Move pane forward"),
+    ("move_window_backward", "Move pane backward"),
+    ("neighboring_window_left", "Focus pane left"),
+    ("neighboring_window_right", "Focus pane right"),
+    ("neighboring_window_up", "Focus pane up"),
+    ("neighboring_window_down", "Focus pane down"),
+    ("resize_left", "Move divider left"),
+    ("resize_right", "Move divider right"),
+    ("resize_up", "Move divider up"),
+    ("resize_down", "Move divider down"),
+    ("toggle_zoom", "Zoom pane"),
+    ("copy_to_clipboard", "Copy"),
+    ("paste_from_clipboard", "Paste"),
+    ("paste_from_selection", "Paste primary selection"),
+    ("search", "Search in scrollback"),
+    ("scroll_line_up", "Scroll line up"),
+    ("scroll_line_down", "Scroll line down"),
+    ("scroll_page_up", "Scroll page up"),
+    ("scroll_page_down", "Scroll page down"),
+    ("scroll_home", "Scroll to top"),
+    ("scroll_end", "Scroll to bottom"),
+    ("clear_scrollback", "Clear scrollback"),
+    ("increase_font_size", "Font bigger"),
+    ("decrease_font_size", "Font smaller"),
+    ("reset_font_size", "Font reset"),
+    ("toggle_transparency", "Transparency on/off"),
+    ("toggle_fullscreen", "Fullscreen on/off"),
+    ("new_os_window", "New OS window"),
+    ("save_session", "Export layout file"),
+    ("open_settings", "Settings page"),
+    ("reload_config", "Reload config"),
+    ("dropdown_next_monitor", "Dropdown: next monitor"),
+    ("dropdown_prev_monitor", "Dropdown: previous monitor"),
+    ("quit", "Quit (session kept)"),
+    ("quit_without_saving", "Quit and forget session"),
+];
+
+/// Default combos for an action (raw, with `kitty_mod`).
+pub fn default_combos(action: &str) -> Vec<&'static str> {
+    DEFAULTS.iter().filter(|(_, a)| *a == action).map(|(c, _)| *c).collect()
+}
+
+pub fn normalize_combo(combo: &str, kitty_mod: &str) -> Option<String> {
+    let (m, k) = parse_combo(combo, kitty_mod)?;
+    let mut v = Vec::new();
+    if m.ctrl {
+        v.push("ctrl".to_string());
+    }
+    if m.shift {
+        v.push("shift".to_string());
+    }
+    if m.alt {
+        v.push("alt".to_string());
+    }
+    if m.sup {
+        v.push("super".to_string());
+    }
+    v.push(k);
+    Some(v.join("+"))
+}
+
+/// Effective combos of an action after config overrides.
+pub fn effective_combos(cfg: &Config, action: &str) -> Vec<String> {
+    let mut out: Vec<String> =
+        default_combos(action).iter().filter_map(|c| normalize_combo(c, &cfg.kitty_mod)).collect();
+    for (combo, act) in &cfg.keybindings {
+        let Some(n) = normalize_combo(combo, &cfg.kitty_mod) else { continue };
+        if act.trim() == action {
+            if !out.contains(&n) {
+                out.push(n);
+            }
+        } else {
+            out.retain(|c| c != &n);
+        }
+    }
+    out
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct Mods {
@@ -378,12 +497,44 @@ fn key_names(ev: &KeyEvent) -> Vec<String> {
     v
 }
 
+/// What Backspace/Delete send (tilda's backspace_key/delete_key).
+#[derive(Clone, Copy, Debug)]
+pub struct KeyCfg {
+    pub backspace: Erase,
+    pub delete: Erase,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Erase {
+    Del,
+    Bs,
+    Escape,
+}
+
+impl KeyCfg {
+    pub fn from_config(cfg: &Config) -> KeyCfg {
+        let e = |s: &str, auto: Erase| match s {
+            "del" => Erase::Del,
+            "bs" => Erase::Bs,
+            "escape" => Erase::Escape,
+            _ => auto,
+        };
+        KeyCfg { backspace: e(&cfg.backspace_sends, Erase::Del), delete: e(&cfg.delete_sends, Erase::Escape) }
+    }
+}
+
+impl Default for KeyCfg {
+    fn default() -> Self {
+        KeyCfg { backspace: Erase::Del, delete: Erase::Escape }
+    }
+}
+
 fn mod_param(m: ModifiersState) -> u8 {
     1 + (m.shift_key() as u8) + 2 * (m.alt_key() as u8) + 4 * (m.control_key() as u8) + 8 * (m.super_key() as u8)
 }
 
 /// Encode a key press into bytes for the PTY.
-pub fn encode(ev: &KeyEvent, mods: ModifiersState, mode: TermMode) -> Option<Vec<u8>> {
+pub fn encode(ev: &KeyEvent, mods: ModifiersState, mode: TermMode, kc: &KeyCfg) -> Option<Vec<u8>> {
     let mp = mod_param(mods);
     let app_cursor = mode.contains(TermMode::APP_CURSOR);
     let csi = |final_: &str, num: Option<u8>| -> Vec<u8> {
@@ -421,7 +572,11 @@ pub fn encode(ev: &KeyEvent, mods: ModifiersState, mode: TermMode) -> Option<Vec
     if let Key::Named(n) = &ev.logical_key {
         let out = match n {
             NamedKey::Enter => Some(alt_prefix(vec![b'\r'])),
-            NamedKey::Backspace => Some(alt_prefix(if mods.control_key() { vec![0x08] } else { vec![0x7f] })),
+            NamedKey::Backspace => Some(alt_prefix(match (kc.backspace, mods.control_key()) {
+                (Erase::Bs, false) | (Erase::Del, true) => vec![0x08],
+                (Erase::Escape, _) => b"\x1b[3~".to_vec(),
+                _ => vec![0x7f],
+            })),
             NamedKey::Tab => Some(if mods.shift_key() { b"\x1b[Z".to_vec() } else { alt_prefix(vec![b'\t']) }),
             NamedKey::Escape => Some(alt_prefix(vec![0x1b])),
             NamedKey::ArrowUp => Some(ss3_or_csi("A")),
@@ -431,7 +586,11 @@ pub fn encode(ev: &KeyEvent, mods: ModifiersState, mode: TermMode) -> Option<Vec
             NamedKey::Home => Some(ss3_or_csi("H")),
             NamedKey::End => Some(ss3_or_csi("F")),
             NamedKey::Insert => Some(tilde(2)),
-            NamedKey::Delete => Some(tilde(3)),
+            NamedKey::Delete => Some(match kc.delete {
+                Erase::Del if mp == 1 => vec![0x7f],
+                Erase::Bs if mp == 1 => vec![0x08],
+                _ => tilde(3),
+            }),
             NamedKey::PageUp => Some(tilde(5)),
             NamedKey::PageDown => Some(tilde(6)),
             NamedKey::F1 => Some(if mp > 1 { csi("P", None) } else { b"\x1bOP".to_vec() }),
@@ -551,7 +710,7 @@ fn is_modifier_key(ev: &KeyEvent) -> bool {
 
 /// Encode a key event using the kitty keyboard protocol.
 /// `event`: 1 press, 2 repeat, 3 release.
-pub fn encode_kitty(ev: &KeyEvent, mods: ModifiersState, mode: TermMode, event: u8) -> Option<Vec<u8>> {
+pub fn encode_kitty(ev: &KeyEvent, mods: ModifiersState, mode: TermMode, event: u8, kc: &KeyCfg) -> Option<Vec<u8>> {
     let all = mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC);
     let types = mode.contains(TermMode::REPORT_EVENT_TYPES);
     let alt_keys = mode.contains(TermMode::REPORT_ALTERNATE_KEYS);
@@ -586,13 +745,13 @@ pub fn encode_kitty(ev: &KeyEvent, mods: ModifiersState, mode: TermMode, event: 
             Fk::U(code) => return Some(format!("\x1b[{code}{}u", mods_part(false)).into_bytes()),
             Fk::Letter(c) => {
                 if !all && event == 1 {
-                    return encode(ev, mods, mode);
+                    return encode(ev, mods, mode, kc);
                 }
                 return Some(format!("\x1b[1{}{c}", mods_part(true)).into_bytes());
             }
             Fk::Tilde(n) => {
                 if !all && event == 1 {
-                    return encode(ev, mods, mode);
+                    return encode(ev, mods, mode, kc);
                 }
                 return Some(format!("\x1b[{n}{}~", mods_part(false)).into_bytes());
             }

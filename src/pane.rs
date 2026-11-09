@@ -87,8 +87,9 @@ impl Pane {
         let rows = rows.max(1);
         let listener = Listener { pane: id, proxy };
         let tcfg = TermConfig {
-            scrolling_history: cfg.scrollback_lines,
+            scrolling_history: cfg.scrollback(),
             kitty_keyboard: cfg.kitty_keyboard,
+            semantic_escape_chars: cfg.semantic_escape_chars(),
             // Reads are gated by `clipboard_read` in the app (ask/allow/deny)
             osc52: alacritty_terminal::term::Osc52::CopyPaste,
             ..Default::default()
@@ -112,11 +113,25 @@ impl Pane {
                 let (prog, args) = opts.program.clone().unwrap();
                 Some(tty::Shell::new(prog, args))
             }
-            Some(cmd) if !cmd.trim().is_empty() => Some(tty::Shell::new(
-                shell.clone(),
-                vec!["-c".into(), format!("{cmd}; exec {shell}")],
-            )),
-            _ => Some(tty::Shell::new(shell.clone(), vec![])),
+            Some(cmd) if !cmd.trim().is_empty() => {
+                // The configured new-tab command follows `command_exit`; session-file commands
+                // always drop to a shell afterwards.
+                let exit_mode = if cmd.trim() == cfg.command.trim() { cfg.command_exit.as_str() } else { "shell" };
+                let login = if cfg.login_shell { " -l" } else { "" };
+                let script = match exit_mode {
+                    "close" => cmd.clone(),
+                    "restart" => format!("while :; do {cmd}; printf '\\r\\n\\r\\n'; done"),
+                    _ => format!("{cmd}; exec {shell}{login}"),
+                };
+                let mut args = Vec::new();
+                if cfg.login_shell {
+                    args.push("-l".to_string());
+                }
+                args.push("-c".into());
+                args.push(script);
+                Some(tty::Shell::new(shell.clone(), args))
+            }
+            _ => Some(tty::Shell::new(shell.clone(), if cfg.login_shell { vec!["-l".into()] } else { vec![] })),
         };
         let topts = tty::Options { shell: shell_opt, working_directory: cwd.clone(), drain_on_exit: false, env };
         let ws = WindowSize {
@@ -197,6 +212,14 @@ impl Pane {
     pub fn shell_idle(&self) -> bool {
         let pg = unsafe { libc::tcgetpgrp(self.pty_fd) };
         pg > 0 && pg as u32 == self.pid
+    }
+
+    /// Title used when the program didn't set one: ⇄ host for remote panes, else the cwd.
+    pub fn fallback_title(&mut self) -> String {
+        let saved = std::mem::take(&mut self.title);
+        let t = self.display_title();
+        self.title = saved;
+        t
     }
 
     /// Name of the foreground process (e.g. "nvim"), if any other than the shell.

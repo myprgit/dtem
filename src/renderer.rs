@@ -109,6 +109,7 @@ pub struct Renderer {
     scale_ctx: ScaleContext,
     /// Background opacity (premultiplied output when < 1)
     pub opacity: f32,
+    alpha_ok: bool,
     pack_x: u32,
     pack_y: u32,
     row_h: u32,
@@ -202,7 +203,7 @@ impl Renderer {
             height: height.max(1),
             present_mode: wgpu::PresentMode::Fifo,
             desired_maximum_frame_latency: 1,
-            alpha_mode: pick_alpha_mode(&caps.alpha_modes, opacity),
+            alpha_mode: pick_alpha_mode(&caps.alpha_modes, 0.5),
             view_formats: vec![],
             color_space: Default::default(),
         };
@@ -325,11 +326,8 @@ impl Renderer {
             inst_cap,
             glyphs: HashMap::new(),
             scale_ctx: ScaleContext::new(),
-            opacity: if opacity < 1.0 && pick_alpha_mode(&caps.alpha_modes, opacity) != wgpu::CompositeAlphaMode::Opaque {
-                opacity.clamp(0.0, 1.0)
-            } else {
-                1.0
-            },
+            alpha_ok: pick_alpha_mode(&caps.alpha_modes, 0.5) != wgpu::CompositeAlphaMode::Opaque,
+            opacity: 1.0,
             pack_x: 0,
             pack_y: 0,
             row_h: 0,
@@ -339,6 +337,7 @@ impl Renderer {
             atlas_full: false,
         };
         r.reset_atlas(gpu);
+        r.set_opacity(opacity);
         r
     }
 
@@ -378,6 +377,11 @@ impl Renderer {
     pub fn set_metrics(&mut self, gpu: &Gpu, m: CellMetrics) {
         self.metrics = m;
         self.reset_atlas(gpu);
+    }
+
+    /// Background opacity (ignored when the surface can't do alpha).
+    pub fn set_opacity(&mut self, o: f32) {
+        self.opacity = if self.alpha_ok { o.clamp(0.0, 1.0) } else { 1.0 };
     }
 
     pub fn resize(&mut self, gpu: &Gpu, w: u32, h: u32) {
