@@ -10,6 +10,12 @@ if [[ -o interactive && -z "$__dtem_loaded" ]]; then
   autoload -Uz add-zsh-hook
   __dtem_precmd() {
     local ec=$?
+    # per-tab history (after .zshrc, which may have set HISTFILE / SHARE_HISTORY)
+    if [[ -n "$DTEM_HISTFILE" && "$HISTFILE" != "$DTEM_HISTFILE" ]]; then
+      unsetopt share_history inc_append_history_time 2>/dev/null
+      setopt inc_append_history
+      fc -p "$DTEM_HISTFILE" "${HISTSIZE:-1000}" "${SAVEHIST:-1000}"
+    fi
     [[ -n $__dtem_running ]] && printf '\e]133;D;%s\a' $ec
     __dtem_running=
     printf '\e]7;file://%s%s\a\e]133;A\a' "$HOST" "$PWD"

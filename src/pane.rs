@@ -53,6 +53,8 @@ pub struct Pane {
     pub remote: Option<crate::remote::Remote>,
     /// Runs the settings page
     pub settings: bool,
+    /// This pane's own shell history file (separate_history)
+    pub history_file: Option<PathBuf>,
     /// kitty graphics images of this terminal
     pub images: Arc<parking_lot::Mutex<crate::images::ImageStore>>,
     pub geo: Arc<crate::stream::Geometry>,
@@ -75,6 +77,13 @@ pub struct SpawnOpts {
     /// Run this program directly instead of the shell (used for remote panes)
     pub program: Option<(String, Vec<String>)>,
     pub remote: Option<crate::remote::Remote>,
+    /// History file to copy for a new per-tab history (the tab it was opened from)
+    pub history_seed: Option<PathBuf>,
+}
+
+/// Per-pane shell history file (bash/zsh).
+pub fn history_path(persist_id: &str) -> PathBuf {
+    crate::config::state_dir().join("history").join(format!("{persist_id}.hist"))
 }
 
 pub fn new_persist_id() -> String {
@@ -117,6 +126,8 @@ impl Pane {
 
         let cwd = opts.cwd.filter(|p| p.is_dir()).or_else(dirs::home_dir);
         let shell = cfg.shell();
+        let persist_id = opts.persist_id.clone().unwrap_or_else(new_persist_id);
+        let mut history_file: Option<PathBuf> = None;
         let mut env = HashMap::new();
         env.insert("TERM".to_string(), "xterm-256color".to_string());
         env.insert("COLORTERM".to_string(), "truecolor".to_string());
@@ -149,6 +160,28 @@ impl Pane {
                 match integrated {
                     Some((args, extra_env)) => {
                         env.extend(extra_env);
+                        if cfg.separate_history {
+                            // every tab keeps its own history (survives restarts with the session)
+                            let hp = history_path(&persist_id);
+                            if !hp.exists() {
+                                let _ = std::fs::create_dir_all(hp.parent().unwrap());
+                                let name = std::path::Path::new(&shell).file_name().and_then(|n| n.to_str()).unwrap_or("");
+                                let default = dirs::home_dir().map(|h| h.join(if name == "zsh" { ".zsh_history" } else { ".bash_history" }));
+                                let seed = opts.history_seed.clone().filter(|p| p.exists()).or(default.filter(|p| p.exists()));
+                                match seed {
+                                    Some(src) => {
+                                        let _ = std::fs::copy(src, &hp);
+                                    }
+                                    None => {
+                                        let _ = std::fs::write(&hp, b"");
+                                    }
+                                }
+                            }
+                            env.insert("DTEM_HISTFILE".into(), hp.display().to_string());
+                            let fish_name: String = persist_id.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+                            env.insert("fish_history".into(), format!("dtem_{fish_name}"));
+                            history_file = Some(hp);
+                        }
                         Some(tty::Shell::new(shell.clone(), args))
                     }
                     None => Some(tty::Shell::new(shell.clone(), if cfg.login_shell { vec!["-l".into()] } else { vec![] })),
@@ -180,7 +213,8 @@ impl Pane {
         el.spawn();
         Ok(Pane {
             id,
-            persist_id: opts.persist_id.unwrap_or_else(new_persist_id),
+            persist_id,
+            history_file,
             term,
             sender,
             pid,

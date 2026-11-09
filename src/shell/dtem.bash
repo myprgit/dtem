@@ -11,12 +11,19 @@ else
   [ -r ~/.bashrc ] && . ~/.bashrc
 fi
 
+# per-tab history: bash reads HISTFILE after the startup files, so this wins over ~/.bashrc
+if [ -n "$DTEM_HISTFILE" ]; then
+  HISTFILE="$DTEM_HISTFILE"
+fi
+
 if [[ $- == *i* && -z "$__dtem_loaded" ]]; then
   __dtem_loaded=1
   __dtem_running=
   __dtem_ready=
   __dtem_precmd() {
     local ec=$?
+    # write each command right away to this tab's own history file (crash/reboot safe)
+    [ -n "$DTEM_HISTFILE" ] && history -a
     [ -n "$__dtem_running" ] && printf '\e]133;D;%s\a' "$ec"
     __dtem_running=
     return $ec

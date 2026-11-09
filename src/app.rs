@@ -159,6 +159,8 @@ pub struct App {
     hint_res: Vec<(HintKind, regex::Regex)>,
     /// global hotkey id → dropdown profile it toggles
     hotkey_targets: Arc<parking_lot::Mutex<HashMap<u32, String>>>,
+    /// history file the next spawned pane copies (the pane a new tab/split was opened from)
+    seed_history: Option<PathBuf>,
     /// touchpad ctrl+scroll accumulator (pixels)
     zoom_acc: f64,
     last_wheel: Option<(Instant, bool)>,
@@ -207,6 +209,7 @@ impl App {
             profile: profile.clone(),
             hint_res: hint_regexes(),
             hotkey_targets: Default::default(),
+            seed_history: None,
 
             zoom_acc: 0.0,
             last_wheel: None,
@@ -506,7 +509,10 @@ impl App {
         win.window.request_redraw();
     }
 
-    fn spawn_pane(&mut self, wid: WindowId, id: u64, opts: SpawnOpts, rect: Rect) -> bool {
+    fn spawn_pane(&mut self, wid: WindowId, id: u64, mut opts: SpawnOpts, rect: Rect) -> bool {
+        if opts.history_seed.is_none() {
+            opts.history_seed = self.seed_history.take();
+        }
         let Some(win) = self.windows.get(&wid) else { return false };
         let (cols, rows) = self.grid_size(win, &rect);
         let m = win.renderer.metrics;
@@ -553,6 +559,7 @@ impl App {
                             title: title.clone(),
                             program,
                             remote,
+                            history_seed: None,
                         },
                     ));
                     Node::Leaf(id)
@@ -634,7 +641,7 @@ impl App {
         self.relayout(wid);
         let r = self.windows[&wid].pane_rects.iter().find(|(i, _)| *i == id).map(|x| x.1).unwrap_or_default();
         let opts =
-            SpawnOpts { cwd, command: None, restore: None, persist_id: None, title: None, program: None, remote: None };
+            SpawnOpts { cwd, command: None, restore: None, persist_id: None, title: None, program: None, remote: None, history_seed: None };
         if !self.spawn_pane(wid, id, opts, r) {
             self.remove_leaf(wid, id);
         }
@@ -1168,6 +1175,38 @@ impl App {
                 self.last_session_json = json;
             }
             session::gc_scrollback(role, &keep);
+            self.gc_history();
+        }
+    }
+
+    /// Remove per-tab history files that no pane of any dtem instance uses anymore.
+    fn gc_history(&self) {
+        let dir = crate::config::state_dir().join("history");
+        let Ok(rd) = std::fs::read_dir(&dir) else { return };
+        // ids referenced by any saved session (other dropdowns/windows too)
+        let mut used: Vec<String> = self.panes.values().map(|p| p.persist_id.clone()).collect();
+        if let Ok(sd) = std::fs::read_dir(crate::config::state_dir()) {
+            for e in sd.flatten() {
+                let n = e.file_name().to_string_lossy().to_string();
+                if n.starts_with("session-") && n.ends_with(".json") {
+                    if let Ok(t) = std::fs::read_to_string(e.path()) {
+                        for part in t.split("\"scrollback\"").skip(1) {
+                            if let Some(id) = part.split('"').nth(1) {
+                                used.push(id.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let Some(id) = name.strip_suffix(".hist") else { continue };
+            let old = e.metadata().and_then(|m| m.modified()).map(|t| t.elapsed().unwrap_or_default()).unwrap_or_default();
+            // grace period: a pane may have just been created by another instance
+            if !used.iter().any(|u| u == id) && old > Duration::from_secs(3600) {
+                let _ = std::fs::remove_file(e.path());
+            }
         }
     }
 
@@ -3858,6 +3897,7 @@ impl App {
             title: Some(title.into()),
             program: Some((exe.display().to_string(), vec![arg])),
             remote: None,
+            history_seed: None,
         };
         if !self.spawn_pane(wid, id, opts, r) {
             self.remove_leaf(wid, id);

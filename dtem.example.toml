@@ -64,6 +64,7 @@ notify_on_bell = true            # desktop notification for bells in tabs you ar
 notify_command_seconds = 10      # notify when a long command finishes unseen (0 = off)
 notify_programs = true           # OSC 9 / OSC 777 notifications from programs
 shell_integration = true         # bash/zsh/fish: prompt jumps, copy last output, remote cwd
+separate_history = true          # every tab keeps its own command history (survives restarts)
 
 # ---- session (restart / reboot)
 persist_scrollback = true

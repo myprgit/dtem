@@ -113,6 +113,8 @@ pub struct Config {
     pub notify_programs: bool,
     /// Load prompt/cwd integration into bash, zsh and fish automatically
     pub shell_integration: bool,
+    /// Each tab keeps its own shell history (needs shell integration)
+    pub separate_history: bool,
 
     // ---- session
     pub persist_scrollback: bool,
@@ -293,6 +295,7 @@ impl Default for Config {
             notify_command_seconds: 10,
             notify_programs: true,
             shell_integration: true,
+            separate_history: true,
             persist_scrollback: true,
             persist_scrollback_lines: 10_000,
             autosave_interval_secs: 5,

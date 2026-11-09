@@ -46,6 +46,7 @@ bash, zsh and fish are started with a small integration script. Your own `.bashr
 | `kitty_mod+g` | copy the last command's output |
 | long-running command notifications | see above |
 | ssh tabs | the remote directory is remembered; after a restart, reconnecting opens there |
+| separate history | every tab has its own command history (Up arrow), kept across restarts; new tabs start from `~/.bash_history` (`separate_history`) |
 
 On hosts opened with `dtem --remote`, the integration, `dtem-copy` and `dtem-icat` are installed into `~/.local` automatically.
 

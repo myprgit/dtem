@@ -425,6 +425,7 @@ impl App {
     /// Replace an exited pane with a fresh shell in the same directory.
     pub(super) fn restart_pane(&mut self, wid: WindowId, id: u64) {
         let cwd = self.panes.get_mut(&id).and_then(|p| p.cwd());
+        self.seed_history = self.panes.get(&id).and_then(|p| p.history_file.clone());
         let rect = self.windows[&wid].pane_rects.iter().find(|(i, _)| *i == id).map(|x| x.1).unwrap_or_default();
         let new = self.alloc_id();
         if let Some(w) = self.windows.get_mut(&wid) {
@@ -439,7 +440,7 @@ impl App {
         if let Some(p) = self.panes.remove(&id) {
             p.shutdown();
         }
-        let opts = SpawnOpts { cwd, command: None, restore: None, persist_id: None, title: None, program: None, remote: None };
+        let opts = SpawnOpts { cwd, command: None, restore: None, persist_id: None, title: None, program: None, remote: None, history_seed: None };
         if !self.spawn_pane(wid, new, opts, rect) {
             self.remove_leaf(wid, new);
         }
