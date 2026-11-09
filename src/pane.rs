@@ -51,6 +51,8 @@ pub struct Pane {
     pub exited: bool,
     /// Pane opened with `dtem --remote`
     pub remote: Option<crate::remote::Remote>,
+    /// Runs the settings page
+    pub settings: bool,
 }
 
 pub struct SpawnOpts {
@@ -163,6 +165,7 @@ impl Pane {
             dirty: true,
             last_cwd: cwd,
             exited: false,
+            settings: opts.program.as_ref().map(|(_, a)| a.iter().any(|x| x.starts_with("--settings"))).unwrap_or(false),
             remote: opts.remote,
         })
     }

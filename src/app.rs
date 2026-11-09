@@ -93,6 +93,7 @@ struct OsWin {
     search: Option<SearchState>,
     scroll_drag: Option<u64>,
     bell_at: Option<Instant>,
+    menu: Option<Menu>,
     cursor: (f64, f64),
     left_down: bool,
     selecting: Option<u64>,
@@ -381,6 +382,7 @@ impl App {
                 search: None,
                 scroll_drag: None,
                 bell_at: None,
+                menu: None,
                 cursor: (0.0, 0.0),
                 left_down: false,
                 selecting: None,
@@ -982,6 +984,9 @@ impl App {
                 win.tabs.iter().map(|t| (t.root.clone(), t.active, t.title.clone())).collect();
             for (root, active, title) in tab_info {
                 let leaves = root.leaf_list();
+                if leaves.iter().all(|id| self.panes.get(id).map(|p| p.settings).unwrap_or(false)) {
+                    continue; // settings page tabs aren't part of the session
+                }
                 let layout = self.snode(&root);
                 tabs.push(TabState { title, active: leaves.iter().position(|x| *x == active).unwrap_or(0), layout });
             }
@@ -1382,31 +1387,7 @@ impl App {
             }
             Action::Quit => self.request_close(el, wid, Confirm::Quit),
             Action::QuitWithoutSaving => self.request_close(el, wid, Confirm::QuitNoSave),
-            Action::OpenSettings => {
-                let Ok(exe) = std::env::current_exe() else { return };
-                let at = self.windows.get(&wid).map(|w| w.active_tab + 1);
-                let id = self.alloc_id();
-                let tab = Tab { root: Node::Leaf(id), active: id, title: Some("⚙ Settings".into()), zoomed: false };
-                let win = self.windows.get_mut(&wid).unwrap();
-                let idx = at.unwrap_or(0).min(win.tabs.len());
-                win.tabs.insert(idx, tab);
-                win.active_tab = idx;
-                self.relayout(wid);
-                let r = self.windows[&wid].pane_rects.first().map(|x| x.1).unwrap_or_default();
-                let opts = SpawnOpts {
-                    cwd: None,
-                    command: None,
-                    restore: None,
-                    persist_id: None,
-                    title: Some("⚙ Settings".into()),
-                    program: Some((exe.display().to_string(), vec!["--settings".into()])),
-                    remote: None,
-                };
-                if !self.spawn_pane(wid, id, opts, r) {
-                    self.remove_leaf(wid, id);
-                }
-                self.after_structure_change(el, wid);
-            }
+            Action::OpenSettings => self.open_settings_tab(el, wid, None),
             Action::None => {}
         }
     }
@@ -1517,6 +1498,9 @@ impl App {
         if self.windows.get(&wid).map(|w| w.preedit.is_some()).unwrap_or(false) {
             return; // input method is composing
         }
+        if self.windows.get(&wid).map(|w| w.menu.is_some()).unwrap_or(false) && self.menu_key(el, wid, &ev) {
+            return;
+        }
         // Close confirmation prompt
         if let Some(c) = self.windows.get(&wid).and_then(|w| w.confirm) {
             if matches!(&ev.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("d")) && self.confirm_is_quit(c) {
@@ -1582,9 +1566,17 @@ impl App {
             return;
         }
         self.last_input = Instant::now();
-        if let Some(a) = self.bindings.lookup(&ev, self.modifiers) {
-            self.do_action(el, wid, a);
-            return;
+        // The settings page captures shortcuts with "report all keys": don't eat them.
+        let capturing = self
+            .active_pane_id(wid)
+            .and_then(|id| self.panes.get(&id))
+            .map(|p| p.settings && p.term.lock().mode().contains(TermMode::REPORT_ALL_KEYS_AS_ESC))
+            .unwrap_or(false);
+        if !capturing {
+            if let Some(a) = self.bindings.lookup(&ev, self.modifiers) {
+                self.do_action(el, wid, a);
+                return;
+            }
         }
         let Some(id) = self.active_pane_id(wid) else { return };
         let Some(p) = self.panes.get(&id) else { return };
@@ -1656,6 +1648,26 @@ impl App {
     fn on_mouse_button(&mut self, el: &ActiveEventLoop, wid: WindowId, state: ElementState, button: MouseButton) {
         let (x, y) = self.windows[&wid].cursor;
         let pressed = state == ElementState::Pressed;
+        if self.windows[&wid].menu.is_some() {
+            self.menu_mouse(el, wid, pressed, button);
+            return;
+        }
+        // Right click: context menu (shift+right click always, even if the app uses the mouse)
+        if pressed && button == MouseButton::Right {
+            if let Some((id, rect)) = self.pane_at(wid, x, y) {
+                let mouse_app = self.panes.get(&id).map(|p| p.term.lock().mode().intersects(TermMode::MOUSE_MODE)).unwrap_or(false);
+                if !mouse_app || self.modifiers.shift_key() {
+                    self.focus_pane(wid, id);
+                    let (point, _, _, _) = self.cell_at(wid, id, rect, x, y);
+                    let url = self.url_at(id, point).map(|u| u.2);
+                    self.open_menu(wid, x as f32, y as f32, url);
+                    return;
+                }
+            } else if self.windows[&wid].tab_rects.iter().any(|(_, r)| r.contains(x as f32, y as f32)) {
+                self.open_menu(wid, x as f32, y as f32, None);
+                return;
+            }
+        }
         // Tab bar
         if pressed {
             let hit = self.windows[&wid].tab_rects.iter().find(|(_, r)| r.contains(x as f32, y as f32)).map(|x| x.0);
@@ -1799,6 +1811,14 @@ impl App {
 
     fn on_cursor_moved(&mut self, wid: WindowId, x: f64, y: f64) {
         self.windows.get_mut(&wid).unwrap().cursor = (x, y);
+        if let Some(menu) = self.windows.get_mut(&wid).unwrap().menu.as_mut() {
+            let h = menu.item_at(x as f32, y as f32);
+            if h != menu.hover {
+                menu.hover = h;
+                self.windows[&wid].window.request_redraw();
+            }
+            return;
+        }
         if let Some(id) = self.windows[&wid].scroll_drag {
             if let Some(r) = self.windows[&wid].pane_rects.iter().find(|(i, _)| *i == id).map(|x| x.1) {
                 self.scroll_to_y(wid, id, r, y);
@@ -2213,6 +2233,35 @@ impl App {
                 win.bell_at = None;
             }
         }
+        // Context menu
+        if let Some(menu) = &win.menu {
+            let h = menu.height();
+            let r = &mut win.renderer;
+            r.rect_top(menu.x + 3.0, menu.y + 3.0, menu.w, h, [0.0, 0.0, 0.0, 0.35]);
+            r.rect_top(menu.x - 1.0, menu.y - 1.0, menu.w + 2.0, h + 2.0, rgba(theme.active_border, 1.0));
+            r.rect_top(menu.x, menu.y, menu.w, h, rgba(theme.tab_bar_bg, 1.0));
+            let mut y = menu.y + 4.0;
+            for (i, it) in menu.items.iter().enumerate() {
+                if it.cmd.is_none() {
+                    r.rect_top(menu.x + 6.0, y + menu.sep_h / 2.0, menu.w - 12.0, 1.0, rgba(theme.inactive_border, 1.0));
+                    y += menu.sep_h;
+                    continue;
+                }
+                let hover = menu.hover == Some(i);
+                if hover {
+                    r.rect_top(menu.x + 2.0, y, menu.w - 4.0, menu.row_h, rgba(theme.sel_bg, 1.0));
+                }
+                let fg = if hover { theme.sel_fg } else { theme.table[256] };
+                let ty = y + ((menu.row_h - m.height) / 2.0).round();
+                r.text(gpu, fonts, &it.label, menu.x + m.width, ty, menu.w - 2.0 * m.width, rgba(fg, 1.0));
+                if !it.hint.is_empty() {
+                    let hw = it.hint.chars().count() as f32 * m.width;
+                    let hc = if hover { theme.sel_fg } else { theme.inactive_border };
+                    r.text(gpu, fonts, &it.hint, menu.x + menu.w - hw - m.width, ty, hw + m.width, rgba(hc, 1.0));
+                }
+                y += menu.row_h;
+            }
+        }
         // Toast (bottom right)
         if let Some((msg, t)) = win.toast.clone() {
             if t.elapsed() < Duration::from_secs(4) {
@@ -2505,6 +2554,79 @@ impl App {
             w.window.request_redraw();
         }
     }
+}
+
+#[derive(Clone)]
+enum MenuCmd {
+    Action(&'static str),
+    CopyLink(String),
+    OpenLink(String),
+    Shortcuts,
+}
+
+/// One row of the right-click menu; `cmd == None` is a separator.
+struct MenuItem {
+    label: String,
+    hint: String,
+    cmd: Option<MenuCmd>,
+}
+
+struct Menu {
+    x: f32,
+    y: f32,
+    w: f32,
+    row_h: f32,
+    sep_h: f32,
+    items: Vec<MenuItem>,
+    hover: Option<usize>,
+}
+
+impl Menu {
+    fn item_at(&self, px: f32, py: f32) -> Option<usize> {
+        if px < self.x || px > self.x + self.w {
+            return None;
+        }
+        let mut y = self.y + 4.0;
+        for (i, it) in self.items.iter().enumerate() {
+            let h = if it.cmd.is_some() { self.row_h } else { self.sep_h };
+            if py >= y && py < y + h {
+                return it.cmd.as_ref().map(|_| i);
+            }
+            y += h;
+        }
+        None
+    }
+
+    fn height(&self) -> f32 {
+        8.0 + self.items.iter().map(|i| if i.cmd.is_some() { self.row_h } else { self.sep_h }).sum::<f32>()
+    }
+}
+
+/// "ctrl+shift+t" → "Ctrl+Shift+T"
+fn pretty_combo(c: &str) -> String {
+    c.split('+')
+        .map(|p| match p {
+            "ctrl" => "Ctrl".to_string(),
+            "shift" => "Shift".to_string(),
+            "alt" => "Alt".to_string(),
+            "super" => "Super".to_string(),
+            "page_up" => "PgUp".to_string(),
+            "page_down" => "PgDn".to_string(),
+            "comma" => ",".to_string(),
+            "period" => ".".to_string(),
+            "equal" => "=".to_string(),
+            "minus" => "-".to_string(),
+            "bracketleft" => "[".to_string(),
+            "bracketright" => "]".to_string(),
+            k if k.len() == 1 => k.to_uppercase(),
+            k if k.starts_with('f') && k[1..].parse::<u8>().is_ok() => k.to_uppercase(),
+            k => {
+                let mut c = k.chars();
+                c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("+")
 }
 
 struct Anim {
@@ -3256,4 +3378,144 @@ fn encode_png(w: u32, h: u32, rgba: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut out = std::io::Cursor::new(Vec::new());
     img.write_to(&mut out, image::ImageFormat::Png)?;
     Ok(out.into_inner())
+}
+
+// ---------------------------------------------------------------------- context menu
+impl App {
+    fn open_menu(&mut self, wid: WindowId, x: f32, y: f32, url: Option<String>) {
+        let hint = |a: &str| keys::effective_combos(&self.cfg, a).first().map(|c| pretty_combo(c)).unwrap_or_default();
+        let item = |label: &str, a: &'static str| MenuItem { label: label.into(), hint: hint(a), cmd: Some(MenuCmd::Action(a)) };
+        let sep = || MenuItem { label: String::new(), hint: String::new(), cmd: None };
+        let mut items = vec![item("New Tab", "new_tab"), item("Close Tab", "close_tab"), sep()];
+        items.push(item("Copy", "copy_to_clipboard"));
+        items.push(item("Paste", "paste_from_clipboard"));
+        if let Some(u) = url {
+            let short: String = if u.chars().count() > 40 { format!("{}…", u.chars().take(40).collect::<String>()) } else { u.clone() };
+            items.push(MenuItem { label: format!("Open Link  {short}"), hint: String::new(), cmd: Some(MenuCmd::OpenLink(u.clone())) });
+            items.push(MenuItem { label: "Copy Link".into(), hint: String::new(), cmd: Some(MenuCmd::CopyLink(u)) });
+        }
+        items.push(sep());
+        items.push(item("Split Horizontally", "hsplit"));
+        items.push(item("Split Vertically", "vsplit"));
+        items.push(item("Close Pane", "close_window"));
+        items.push(sep());
+        items.push(item("Toggle Fullscreen", "toggle_fullscreen"));
+        items.push(item("Toggle Transparency", "toggle_transparency"));
+        items.push(item("Toggle Searchbar", "search"));
+        items.push(sep());
+        items.push(item("Preferences…", "open_settings"));
+        items.push(MenuItem { label: "Keyboard Shortcuts…".into(), hint: String::new(), cmd: Some(MenuCmd::Shortcuts) });
+        items.push(sep());
+        items.push(item("Quit", "quit"));
+
+        let Some(win) = self.windows.get_mut(&wid) else { return };
+        let m = win.renderer.metrics;
+        let (ww, wh) = win.renderer.size();
+        let lw = items.iter().map(|i| i.label.chars().count()).max().unwrap_or(10);
+        let hw = items.iter().map(|i| i.hint.chars().count()).max().unwrap_or(0);
+        let w = ((lw + hw + 6) as f32 * m.width).min(ww);
+        let mut menu = Menu { x, y, w, row_h: (m.height + 6.0 * win.scale as f32).round(), sep_h: 7.0, items, hover: None };
+        let h = menu.height();
+        if menu.x + w > ww {
+            menu.x = (ww - w).max(0.0);
+        }
+        if menu.y + h > wh {
+            menu.y = (y - h).max(0.0);
+        }
+        win.menu = Some(menu);
+        win.window.request_redraw();
+    }
+
+    fn run_menu(&mut self, el: &ActiveEventLoop, wid: WindowId, cmd: MenuCmd) {
+        match cmd {
+            MenuCmd::Action(a) => {
+                if let Some(a) = Action::parse(a) {
+                    self.do_action(el, wid, a);
+                }
+            }
+            MenuCmd::CopyLink(u) => self.clip_set(false, u),
+            MenuCmd::OpenLink(u) => self.open_url(&u),
+            MenuCmd::Shortcuts => self.open_settings_tab(el, wid, Some("keys")),
+        }
+    }
+
+    /// Mouse/keyboard while the menu is open. Returns true if consumed.
+    fn menu_mouse(&mut self, el: &ActiveEventLoop, wid: WindowId, pressed: bool, button: MouseButton) -> bool {
+        let Some(win) = self.windows.get_mut(&wid) else { return false };
+        let Some(menu) = win.menu.as_ref() else { return false };
+        let (x, y) = (win.cursor.0 as f32, win.cursor.1 as f32);
+        if !pressed {
+            return true;
+        }
+        let hit = menu.item_at(x, y);
+        let inside = x >= menu.x && x <= menu.x + menu.w && y >= menu.y && y <= menu.y + menu.height();
+        if inside && hit.is_none() {
+            return true; // separator / padding
+        }
+        let cmd = hit.and_then(|i| menu.items[i].cmd.clone()).filter(|_| button == MouseButton::Left);
+        win.menu = None;
+        win.window.request_redraw();
+        if let Some(c) = cmd {
+            self.run_menu(el, wid, c);
+        }
+        true
+    }
+
+    fn menu_key(&mut self, el: &ActiveEventLoop, wid: WindowId, ev: &KeyEvent) -> bool {
+        let Some(win) = self.windows.get_mut(&wid) else { return false };
+        let Some(menu) = win.menu.as_mut() else { return false };
+        let selectable: Vec<usize> = menu.items.iter().enumerate().filter(|(_, i)| i.cmd.is_some()).map(|(i, _)| i).collect();
+        let pos = menu.hover.and_then(|h| selectable.iter().position(|&i| i == h));
+        match &ev.logical_key {
+            Key::Named(NamedKey::ArrowDown) => {
+                menu.hover = Some(selectable[pos.map(|p| (p + 1) % selectable.len()).unwrap_or(0)]);
+            }
+            Key::Named(NamedKey::ArrowUp) => {
+                menu.hover = Some(selectable[pos.map(|p| (p + selectable.len() - 1) % selectable.len()).unwrap_or(selectable.len() - 1)]);
+            }
+            Key::Named(NamedKey::Enter) => {
+                let cmd = menu.hover.and_then(|h| menu.items[h].cmd.clone());
+                win.menu = None;
+                if let Some(c) = cmd {
+                    self.run_menu(el, wid, c);
+                }
+            }
+            _ => win.menu = None,
+        }
+        if let Some(w) = self.windows.get(&wid) {
+            w.window.request_redraw();
+        }
+        true
+    }
+
+    fn open_settings_tab(&mut self, el: &ActiveEventLoop, wid: WindowId, section: Option<&str>) {
+        let Ok(exe) = std::env::current_exe() else { return };
+        let arg = match section {
+            Some(s) => format!("--settings={s}"),
+            None => "--settings".into(),
+        };
+        let at = self.windows.get(&wid).map(|w| w.active_tab + 1);
+        let id = self.alloc_id();
+        let title = if section == Some("keys") { "⌨ Shortcuts" } else { "⚙ Settings" };
+        let tab = Tab { root: Node::Leaf(id), active: id, title: Some(title.into()), zoomed: false };
+        let win = self.windows.get_mut(&wid).unwrap();
+        let idx = at.unwrap_or(0).min(win.tabs.len());
+        win.tabs.insert(idx, tab);
+        win.active_tab = idx;
+        self.relayout(wid);
+        let r = self.windows[&wid].pane_rects.first().map(|x| x.1).unwrap_or_default();
+        let opts = SpawnOpts {
+            cwd: None,
+            command: None,
+            restore: None,
+            persist_id: None,
+            title: Some(title.into()),
+            program: Some((exe.display().to_string(), vec![arg])),
+            remote: None,
+        };
+        if !self.spawn_pane(wid, id, opts, r) {
+            self.remove_leaf(wid, id);
+        }
+        self.after_structure_change(el, wid);
+    }
 }

@@ -27,9 +27,13 @@ dtem --import-tilda              # reads ~/.config/tilda/config_0 (or pass a fil
 
 The importer converts every tilda option: hotkey, size/position/centering, monitor, slide animation, auto-hide, the unfocused-hotkey behaviour, always-on-top, sticky, taskbar, transparency, colors and palette, cursor, bold-is-bright, bell, scrollback, word chars, backspace/delete codes, command/login shell/working dir, title options, tab bar options, link matching, confirmations, and all key bindings. Your previous config is backed up first. A few options have no counterpart in dtem (tooltips, notebook border, set-as-desktop); the importer lists them.
 
+## Right-click menu
+
+Right-click on a terminal (or the tab bar) opens a menu like tilda's: New Tab, Close Tab, Copy, Paste, Open/Copy Link (when clicking a link), splits, Toggle Fullscreen / Transparency / Searchbar, Preferences…, Keyboard Shortcuts…, and Quit. Each item shows its current shortcut. If a program uses the mouse (vim, htop), use **Shift+right-click**.
+
 ## Settings page
 
-Open it with `kitty_mod+F2` or `ctrl+,` (it opens in a new tab), or run `dtem --settings`. All options are grouped there: appearance, colors, dropdown, behavior, shell & titles, session and key bindings. Changes are saved to `dtem.toml` with comments preserved, and running instances apply them live (config hot-reload).
+Open it with `ctrl+,` or `kitty_mod+F2`, or with right-click → Preferences… (it opens in a new tab). You can also run `dtem --settings`. The **Keys** section is the shortcut editor (right-click → Keyboard Shortcuts…, or `dtem --settings=keys`): select an action and press Enter, then press the new key combination. `a` adds a second combination, `e` lets you type combinations, `x` unbinds the action and `r` restores its default. If a combination is already used by another action, it is moved to the new one and the editor reports this. All options are grouped there: appearance, colors, dropdown, behavior, shell & titles, session and key bindings. Changes are saved to `dtem.toml` with comments preserved, and running instances apply them live (config hot-reload).
 
 ## Usage
 

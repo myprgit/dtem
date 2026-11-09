@@ -3,7 +3,10 @@
 //! dtem instances pick it up live.
 use crate::config::{hex, parse_color, Config, Theme};
 use crate::{confedit, keys, schemes};
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -195,7 +198,83 @@ fn display(v: Option<&toml::Value>) -> String {
     }
 }
 
+/// Waiting for a key combination (Keys section). `true` = add instead of replace.
+type Capture = Option<bool>;
+
+/// crossterm key event → dtem combo ("ctrl+shift+t"); None for lone modifiers.
+fn combo_of(k: &KeyEvent) -> Option<String> {
+    let mut shift = k.modifiers.contains(KeyModifiers::SHIFT);
+    let key = match k.code {
+        KeyCode::Char(c) => match c.to_ascii_lowercase() {
+            ' ' => "space".to_string(),
+            '=' => "equal".into(),
+            '+' => "plus".into(),
+            '-' => "minus".into(),
+            ',' => "comma".into(),
+            '.' => "period".into(),
+            '[' => "bracketleft".into(),
+            ']' => "bracketright".into(),
+            '/' => "slash".into(),
+            '\\' => "backslash".into(),
+            '`' => "grave".into(),
+            ';' => "semicolon".into(),
+            '\'' => "apostrophe".into(),
+            c => c.to_string(),
+        },
+        KeyCode::F(n) => format!("f{n}"),
+        KeyCode::Enter => "enter".into(),
+        KeyCode::Tab => "tab".into(),
+        KeyCode::BackTab => {
+            shift = true;
+            "tab".into()
+        }
+        KeyCode::Backspace => "backspace".into(),
+        KeyCode::Delete => "delete".into(),
+        KeyCode::Insert => "insert".into(),
+        KeyCode::Home => "home".into(),
+        KeyCode::End => "end".into(),
+        KeyCode::PageUp => "page_up".into(),
+        KeyCode::PageDown => "page_down".into(),
+        KeyCode::Left => "left".into(),
+        KeyCode::Right => "right".into(),
+        KeyCode::Up => "up".into(),
+        KeyCode::Down => "down".into(),
+        KeyCode::Esc => "escape".into(),
+        _ => return None,
+    };
+    let mut v = Vec::new();
+    if k.modifiers.contains(KeyModifiers::CONTROL) {
+        v.push("ctrl".to_string());
+    }
+    if shift {
+        v.push("shift".to_string());
+    }
+    if k.modifiers.contains(KeyModifiers::ALT) {
+        v.push("alt".to_string());
+    }
+    if k.modifiers.contains(KeyModifiers::SUPER) {
+        v.push("super".to_string());
+    }
+    v.push(key);
+    Some(v.join("+"))
+}
+
+fn set_capture(on: bool) {
+    let mut out = std::io::stdout();
+    if on {
+        let _ = ratatui::crossterm::execute!(
+            out,
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+            )
+        );
+    } else {
+        let _ = ratatui::crossterm::execute!(out, PopKeyboardEnhancementFlags);
+    }
+}
+
 struct App {
+    capture: Capture,
     sections: Vec<Section>,
     tab: usize,
     sel: Vec<ListState>,
@@ -341,6 +420,25 @@ impl App {
         }
     }
 
+    /// Bind a captured combo to `action` (replace or add), reporting what it took over.
+    fn bind_captured(&mut self, action: &str, combo: String, add: bool) {
+        let taken: Vec<&str> = keys::ACTIONS
+            .iter()
+            .filter(|(a, _)| *a != action && keys::effective_combos(&self.cfg, a).contains(&combo))
+            .map(|(_, d)| *d)
+            .collect();
+        let mut list = if add { keys::effective_combos(&self.cfg, action) } else { Vec::new() };
+        if !list.contains(&combo) {
+            list.push(combo.clone());
+        }
+        self.rebind(action, list);
+        if !taken.is_empty() {
+            self.status = format!("{combo} assigned (removed from: {})", taken.join(", "));
+        } else {
+            self.status = format!("{combo} assigned — applied live");
+        }
+    }
+
     /// Make `action` bound to exactly `combos` (defaults unbound with "none" when removed).
     fn rebind(&mut self, action: &str, combos: Vec<String>) {
         let kmod = self.cfg.kitty_mod.clone();
@@ -425,8 +523,9 @@ fn swatch(s: &str) -> Option<Color> {
     Some(Color::Rgb(c[0], c[1], c[2]))
 }
 
-pub fn run() -> anyhow::Result<()> {
+pub fn run(section: Option<String>) -> anyhow::Result<()> {
     let mut app = App {
+        capture: None,
         sections: sections(),
         tab: 0,
         sel: Vec::new(),
@@ -442,6 +541,11 @@ pub fn run() -> anyhow::Result<()> {
         s
     }).collect();
     app.reload();
+    if let Some(sec) = section {
+        if let Some(i) = app.sections.iter().position(|s| s.name.to_lowercase().starts_with(&sec.to_lowercase())) {
+            app.tab = i;
+        }
+    }
 
     let mut term = ratatui::init();
     let res = (|| -> anyhow::Result<()> {
@@ -486,7 +590,14 @@ pub fn run() -> anyhow::Result<()> {
                 f.render_stateful_widget(list, mid, &mut app.sel[app.tab]);
 
                 let help_text = match (&app.editing, app.item()) {
+                    _ if app.capture.is_some() => format!(
+                        " {}: PRESS THE NEW KEY COMBINATION…   (Esc: cancel)",
+                        app.item().map(|i| i.label.trim().to_string()).unwrap_or_default()
+                    ),
                     (Some(buf), Some(item)) => format!(" {}: {buf}▏   Enter: save   Esc: cancel", item.label.trim()),
+                    (None, Some(item)) if matches!(item.kind, Kind::Binding(_)) => {
+                        " Enter: press new key   a: add another key   e: type keys   x: unbind   r: default\n Tab/Shift+Tab: section  ↑↓: select  q: quit".to_string()
+                    }
                     (None, Some(item)) => format!(
                         " {}\n Tab/Shift+Tab: section  ↑↓: select  ←→/Space: change  Enter: edit  r: reset  q: quit",
                         item.help
@@ -499,6 +610,21 @@ pub fn run() -> anyhow::Result<()> {
 
             let Event::Key(k) = event::read()? else { continue };
             if k.kind != KeyEventKind::Press {
+                continue;
+            }
+            if let Some(add) = app.capture {
+                if matches!(k.code, KeyCode::Modifier(_)) {
+                    continue;
+                }
+                app.capture = None;
+                set_capture(false);
+                if k.code == KeyCode::Esc && k.modifiers.is_empty() {
+                    app.status = "cancelled".into();
+                    continue;
+                }
+                if let (Some(combo), Some(Kind::Binding(action))) = (combo_of(&k), app.item().map(|i| i.kind.clone())) {
+                    app.bind_captured(action, combo, add);
+                }
                 continue;
             }
             if let Some(buf) = app.editing.as_mut() {
@@ -533,6 +659,22 @@ pub fn run() -> anyhow::Result<()> {
                     if let Some(item) = app.item().cloned() {
                         let dir = if matches!(k.code, KeyCode::Left | KeyCode::Char('h')) { -1 } else { 1 };
                         app.adjust(&item, dir);
+                    }
+                }
+                KeyCode::Enter | KeyCode::Char('a') | KeyCode::Char('e') | KeyCode::Char('x')
+                    if matches!(app.item().map(|i| &i.kind), Some(Kind::Binding(_))) =>
+                {
+                    let Some(Kind::Binding(action)) = app.item().map(|i| i.kind.clone()) else { continue };
+                    match k.code {
+                        KeyCode::Char('e') => app.editing = Some(keys::effective_combos(&app.cfg, action).join(", ")),
+                        KeyCode::Char('x') => {
+                            app.rebind(action, Vec::new());
+                            app.status = "unbound".into();
+                        }
+                        _ => {
+                            app.capture = Some(k.code == KeyCode::Char('a'));
+                            set_capture(true);
+                        }
                     }
                 }
                 KeyCode::Enter => {

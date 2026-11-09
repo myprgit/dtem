@@ -45,7 +45,7 @@ USAGE:
   dtem --install-gnome-shortcut register the dropdown hotkey in GNOME (X11 + Wayland)
   dtem --quit [--dropdown] [--no-save]
                                 quit the running instance (--no-save: forget the session)
-  dtem --settings               settings page (also kitty_mod+F2 / ctrl+, inside dtem)
+  dtem --settings[=keys]        settings page / shortcut editor (also ctrl+, or right click)
   dtem --import-tilda [FILE]    import a tilda config (default ~/.config/tilda/config_0)
 
 Config:  ~/.config/dtem/dtem.toml
@@ -60,7 +60,7 @@ struct Args {
     install_shortcut: bool,
     quit: bool,
     no_save: bool,
-    settings: bool,
+    settings: Option<Option<String>>,
     import_tilda: Option<Option<PathBuf>>,
     remote: Option<Vec<String>>,
 }
@@ -75,7 +75,7 @@ fn parse_args() -> Args {
         install_shortcut: false,
         quit: false,
         no_save: false,
-        settings: false,
+        settings: None,
         import_tilda: None,
         remote: None,
     };
@@ -92,7 +92,8 @@ fn parse_args() -> Args {
             "--install-gnome-shortcut" => a.install_shortcut = true,
             "--quit" => a.quit = true,
             "--no-save" => a.no_save = true,
-            "--settings" => a.settings = true,
+            "--settings" => a.settings = Some(None),
+            s if s.starts_with("--settings=") => a.settings = Some(Some(s["--settings=".len()..].to_string())),
             "--import-tilda" => {
                 let next = it.next();
                 if next.as_deref().map(|n| n.starts_with('-')).unwrap_or(false) {
@@ -298,8 +299,8 @@ fn main() {
         }
         return;
     }
-    if args.settings {
-        if let Err(e) = settings::run() {
+    if let Some(section) = args.settings.clone() {
+        if let Err(e) = settings::run(section) {
             eprintln!("settings: {e}");
             std::process::exit(1);
         }
