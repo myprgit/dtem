@@ -97,6 +97,9 @@ struct OsWin {
     ignore_moves_until: Option<Instant>,
     /// Re-apply the dropdown geometry after the WM restored it (leaving fullscreen)
     reapply_geometry_at: Option<Instant>,
+    /// Go fullscreen again (on the remembered monitor) at this time — used to move a
+    /// fullscreen dropdown to another monitor
+    refullscreen_at: Option<Instant>,
     cursor: (f64, f64),
     left_down: bool,
     selecting: Option<u64>,
@@ -418,6 +421,7 @@ impl App {
                 hints: None,
                 ignore_moves_until: None,
                 reapply_geometry_at: None,
+                refullscreen_at: None,
                 was_fullscreen: dropdown && (ws.map(|w| w.fullscreen).unwrap_or(false) || self.dd().start_fullscreen),
                 cursor: (0.0, 0.0),
                 left_down: false,
@@ -956,7 +960,7 @@ impl App {
         let d = self.dd();
         let Some(win) = self.windows.get_mut(&wid) else { return };
         if win.visible {
-            win.was_fullscreen = win.window.fullscreen().is_some();
+            win.was_fullscreen = win.window.fullscreen().is_some() || win.refullscreen_at.take().is_some();
             if win.was_fullscreen {
                 // leave fullscreen before unmapping so the WM restores it cleanly next time
                 self.set_fullscreen(wid, false, None);
@@ -1057,7 +1061,15 @@ impl App {
         let idx = mons.iter().position(|m| m.name() == cur).unwrap_or(0) as i32;
         let next = (idx + step).rem_euclid(mons.len() as i32) as usize;
         self.windows.get_mut(&wid).unwrap().monitor = mons[next].name();
-        self.apply_dropdown_geometry(el, wid);
+        if self.windows[&wid].window.fullscreen().is_some() {
+            // leave fullscreen, move to the new monitor (geometry re-apply), then fullscreen there
+            self.set_fullscreen(wid, false, None);
+            let w = self.windows.get_mut(&wid).unwrap();
+            w.reapply_geometry_at = Some(Instant::now() + Duration::from_millis(120));
+            w.refullscreen_at = Some(Instant::now() + Duration::from_millis(300));
+        } else {
+            self.apply_dropdown_geometry(el, wid);
+        }
         self.mark_save_soon();
     }
 
@@ -3278,7 +3290,16 @@ impl ApplicationHandler<UserEvent> for App {
                 self.apply_dropdown_geometry(el, wid);
             }
         }
-        if let Some(t) = self.windows.values().filter_map(|w| w.reapply_geometry_at).min() {
+        let due: Vec<WindowId> =
+            self.windows.iter().filter(|(_, w)| w.refullscreen_at.map(|t| now >= t).unwrap_or(false)).map(|(id, _)| *id).collect();
+        for wid in due {
+            self.windows.get_mut(&wid).unwrap().refullscreen_at = None;
+            if self.windows[&wid].visible {
+                let mon = self.dropdown_monitor(el, wid);
+                self.set_fullscreen(wid, true, mon);
+            }
+        }
+        if let Some(t) = self.windows.values().filter_map(|w| w.reapply_geometry_at.into_iter().chain(w.refullscreen_at).min()).min() {
             next = next.min(t);
         }
 
