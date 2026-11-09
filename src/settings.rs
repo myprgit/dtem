@@ -25,6 +25,8 @@ enum Kind {
     Palette(usize),
     Hotkeys,
     Binding(&'static str),
+    /// GNOME's system-wide `enable-animations` (gsettings, not dtem.toml)
+    GnomeAnimations,
 }
 
 #[derive(Clone)]
@@ -166,6 +168,35 @@ fn sections() -> Vec<Section> {
 }
 
 fn dropdown_items(p: &str) -> Vec<Item> {
+    let mut v = dropdown_items_inner(p);
+    if p == "dropdown" {
+        let at = v.iter().position(|i| i.path.ends_with(".animation")).unwrap_or(v.len());
+        v.insert(
+            at,
+            it("gnome.enable-animations", "GNOME animations", Kind::GnomeAnimations, "system-wide GNOME setting (all windows, not only dtem)"),
+        );
+    }
+    v
+}
+
+fn gnome_animations() -> Option<bool> {
+    let out = std::process::Command::new("gsettings").args(["get", "org.gnome.desktop.interface", "enable-animations"]).output().ok()?;
+    match String::from_utf8_lossy(&out.stdout).trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn set_gnome_animations(on: bool) -> bool {
+    std::process::Command::new("gsettings")
+        .args(["set", "org.gnome.desktop.interface", "enable-animations", if on { "true" } else { "false" }])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn dropdown_items_inner(p: &str) -> Vec<Item> {
     use Kind::*;
     let f = |k: &str| format!("{p}.{k}");
     let first = if p == "dropdown" {
@@ -303,6 +334,7 @@ struct App {
     cands: Vec<String>,
     cand_sel: Option<usize>,
     cache: std::collections::HashMap<&'static str, Vec<String>>,
+    gnome_anim: Option<bool>,
     sections: Vec<Section>,
     tab: usize,
     sel: Vec<ListState>,
@@ -349,6 +381,10 @@ impl App {
     fn value_of(&self, item: &Item) -> String {
         match &item.kind {
             Kind::Binding(a) => keys::effective_combos(&self.cfg, a).join(", "),
+            Kind::GnomeAnimations => match self.gnome_anim {
+                Some(b) => b.to_string(),
+                None => "unavailable".into(),
+            },
             Kind::Palette(i) => hex(self.theme.table[*i]),
             Kind::Percent(..) => {
                 let f = self.eff_value(&item.path).and_then(|v| v.as_float()).unwrap_or(0.0);
@@ -397,6 +433,10 @@ impl App {
         let input = input.trim().to_string();
         let path = item.path.clone();
         match item.kind.clone() {
+            Kind::GnomeAnimations => {
+                let on = matches!(input.as_str(), "true" | "yes" | "1" | "on");
+                self.set_gnome(on);
+            }
             Kind::Bool => {
                 let b = matches!(input.as_str(), "true" | "yes" | "1" | "on");
                 self.write(|d| confedit::set(d, &path, b));
@@ -526,7 +566,24 @@ impl App {
         });
     }
 
+    fn set_gnome(&mut self, on: bool) {
+        if self.gnome_anim.is_none() {
+            self.status = "GNOME settings not available (gsettings)".into();
+            return;
+        }
+        if set_gnome_animations(on) {
+            self.gnome_anim = gnome_animations();
+            self.status = format!("GNOME animations {} (system-wide)", if on { "on" } else { "off" });
+        } else {
+            self.status = "gsettings failed".into();
+        }
+    }
+
     fn reset(&mut self, item: &Item) {
+        if matches!(item.kind, Kind::GnomeAnimations) {
+            self.set_gnome(true); // GNOME's default
+            return;
+        }
         let path = item.path.clone();
         match item.kind {
             Kind::Binding(a) => {
@@ -547,6 +604,7 @@ impl App {
         let cur = self.value_of(item);
         match &item.kind {
             Kind::Bool => self.set_value(item, if cur == "true" { "false" } else { "true" }),
+            Kind::GnomeAnimations => self.set_gnome(cur != "true"),
             Kind::Choice(opts) => {
                 let i = opts.iter().position(|o| *o == cur).unwrap_or(0) as i64;
                 let n = (i + dir).rem_euclid(opts.len() as i64) as usize;
@@ -799,6 +857,7 @@ pub fn run(section: Option<String>) -> anyhow::Result<()> {
         cands: Vec::new(),
         cand_sel: None,
         cache: Default::default(),
+        gnome_anim: gnome_animations(),
         sections: sections(),
         tab: 0,
         sel: Vec::new(),
@@ -848,7 +907,8 @@ pub fn run(section: Option<String>) -> anyhow::Result<()> {
                             spans.push(Span::raw(" "));
                         }
                         let shown = match item.kind {
-                            Kind::Bool => if v == "true" { "[x] on".into() } else { "[ ] off".into() },
+                            Kind::Bool | Kind::GnomeAnimations if v == "true" => "[x] on".into(),
+                            Kind::Bool | Kind::GnomeAnimations if v == "false" => "[ ] off".into(),
                             Kind::Choice(_) => format!("‹ {v} ›"),
                             _ => v,
                         };
@@ -1013,7 +1073,7 @@ pub fn run(section: Option<String>) -> anyhow::Result<()> {
                 KeyCode::Enter => {
                     if let Some(item) = app.item().cloned() {
                         match item.kind {
-                            Kind::Bool | Kind::Choice(_) => app.adjust(&item, 1),
+                            Kind::Bool | Kind::Choice(_) | Kind::GnomeAnimations => app.adjust(&item, 1),
                             _ => {
                                 let v = app.value_of(&item);
                                 let v = v.trim_end_matches(" (scheme)").trim_end_matches('%').to_string();
