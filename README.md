@@ -68,8 +68,6 @@ color_scheme = "dracula"
 
 Each dropdown has its own tabs, session, monitor memory and settings; they appear on the settings page as **Dropdown** and **Dropdown 2**. `dtem --toggle=2` toggles it, and `dtem --install-gnome-shortcut` registers the hotkeys of all dropdowns.
 
-Dropdowns are utility windows, so GNOME doesn't animate them. F11 makes them cover their monitor; they don't use the WM's fullscreen mode.
-
 ## Right-click menu
 
 Right-click on a terminal (or the tab bar) opens a menu like tilda's: New Tab, Close Tab, Copy, Paste, Open/Copy Link (when clicking a link), splits, Toggle Fullscreen / Transparency / Searchbar, Preferences…, Keyboard Shortcuts…, and Quit. Each item shows its current shortcut. If a program uses the mouse (vim, htop), use **Shift+right-click**.

@@ -93,8 +93,6 @@ struct OsWin {
     hints: Option<Hints>,
     /// Dropdown: fullscreen state when it was last hidden (restored on show)
     was_fullscreen: bool,
-    /// Dropdown "fullscreen" done by covering the monitor while staying a utility window
-    pseudo_fs: bool,
     cursor: (f64, f64),
     left_down: bool,
     selecting: Option<u64>,
@@ -308,11 +306,6 @@ impl App {
                 monitor_name = m.name();
             }
             attrs = attrs.with_decorations(false).with_visible(false);
-            // Always a utility window: GNOME Shell doesn't animate those when they map/unmap
-            {
-                use winit::platform::x11::{WindowAttributesExtX11, WindowType};
-                attrs = attrs.with_x11_window_type(vec![WindowType::Utility]);
-            }
             if self.dd().always_on_top {
                 attrs = attrs.with_window_level(WindowLevel::AlwaysOnTop);
             }
@@ -419,7 +412,6 @@ impl App {
                 bell_at: None,
                 menu: None,
                 hints: None,
-                pseudo_fs: false,
                 was_fullscreen: dropdown && (ws.map(|w| w.fullscreen).unwrap_or(false) || self.dd().start_fullscreen),
                 cursor: (0.0, 0.0),
                 left_down: false,
@@ -868,7 +860,7 @@ impl App {
     }
 
     fn apply_dropdown_geometry(&mut self, el: &ActiveEventLoop, wid: WindowId) {
-        if self.windows.get(&wid).map(|w| w.pseudo_fs || w.window.fullscreen().is_some()).unwrap_or(false) {
+        if self.windows.get(&wid).map(|w| w.window.fullscreen().is_some()).unwrap_or(false) {
             return;
         }
         let name = self.windows.get(&wid).and_then(|w| w.monitor.clone());
@@ -926,22 +918,9 @@ impl App {
         }
     }
 
-    /// Enter/leave fullscreen. Dropdowns stay utility windows (mutter won't make those
-    /// fullscreen), so they cover their monitor instead; normal windows use real fullscreen.
+    /// Enter/leave fullscreen (the WM's real fullscreen, on the window's monitor).
     fn set_fullscreen(&mut self, wid: WindowId, on: bool) {
-        let Some(w) = self.windows.get_mut(&wid) else { return };
-        if w.dropdown {
-            if on {
-                if let Some(m) = w.window.current_monitor().filter(|m| m.size().width >= 100 && m.size().height >= 100) {
-                    w.pseudo_fs = true;
-                    w.window.set_outer_position(m.position());
-                    let _ = w.window.request_inner_size(m.size());
-                }
-            } else {
-                w.pseudo_fs = false; // caller restores the dropdown geometry
-            }
-            return;
-        }
+        let Some(w) = self.windows.get(&wid) else { return };
         if on {
             let mon = w.window.current_monitor();
             w.window.set_fullscreen(Some(Fullscreen::Borderless(mon)));
@@ -955,7 +934,7 @@ impl App {
         let d = self.dd();
         let Some(win) = self.windows.get_mut(&wid) else { return };
         if win.visible {
-            win.was_fullscreen = win.pseudo_fs || win.window.fullscreen().is_some();
+            win.was_fullscreen = win.window.fullscreen().is_some();
             if win.was_fullscreen {
                 // leave fullscreen before unmapping so the WM restores it cleanly next time
                 self.set_fullscreen(wid, false);
@@ -1093,7 +1072,7 @@ impl App {
                 width: Some(if maximized { win.size.0 } else { size.width }),
                 height: Some(if maximized { win.size.1 } else { size.height }),
                 maximized,
-                fullscreen: if win.dropdown && !win.visible { win.was_fullscreen } else { win.pseudo_fs || win.window.fullscreen().is_some() },
+                fullscreen: if win.dropdown && !win.visible { win.was_fullscreen } else { win.window.fullscreen().is_some() },
                 monitor,
                 font_size: Some(win.font_size),
                 active_tab: win.active_tab,
@@ -1444,7 +1423,7 @@ impl App {
             }
             Action::ToggleFullscreen => {
                 let w = &self.windows[&wid];
-                let on = !(w.pseudo_fs || w.window.fullscreen().is_some());
+                let on = !(w.window.fullscreen().is_some());
                 self.set_fullscreen(wid, on);
                 if !on && self.windows[&wid].dropdown {
                     self.apply_dropdown_geometry(el, wid);
@@ -3141,7 +3120,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let gpu = self.gpu.as_ref().unwrap();
                 let win = self.windows.get_mut(&wid).unwrap();
                 win.renderer.resize(gpu, size.width, size.height);
-                if !win.window.is_maximized() && win.window.fullscreen().is_none() && !win.pseudo_fs {
+                if !win.window.is_maximized() && win.window.fullscreen().is_none() {
                     win.size = (size.width, size.height);
                 }
                 self.relayout(wid);
