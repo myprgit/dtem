@@ -1,0 +1,57 @@
+# dtem config — copy to ~/.config/dtem/dtem.toml
+# Every key is optional; defaults shown.
+
+font_family = "monospace"      # any fontconfig name, e.g. "JetBrains Mono"
+font_size = 11.0               # points
+line_height = 1.0
+padding = 4.0
+scrollback_lines = 10000
+cursor_shape = "block"         # block | beam | underline
+copy_on_select = false
+tab_bar_min_tabs = 2           # like kitty: show tab bar from 2 tabs on (1 = always)
+# shell = "/usr/bin/zsh"       # default: $SHELL
+
+# --- persistence (restart / reboot) ---
+persist_scrollback = true
+persist_scrollback_lines = 10000
+autosave_interval_secs = 5     # session is also saved on exit and on SIGTERM/SIGHUP
+
+# Wayland: normal windows are native Wayland. Wayland doesn't let apps restore window
+# positions; set this to run them via XWayland if you want positions restored too.
+force_x11 = false
+
+kitty_mod = "ctrl+shift"
+
+[confirm_close]
+tab = true        # ask before closing a tab
+pane = true       # ask before closing a split pane
+window = true     # ask before closing a window / quitting
+
+[dropdown]
+hotkey = "F12"               # X11: grabbed directly. GNOME (X11+Wayland): dtem --install-gnome-shortcut
+height = 0.45                # fraction of the monitor
+width = 1.0
+hide_on_focus_loss = false
+
+[colors]
+foreground = "#dddddd"
+background = "#1a1b26"
+cursor = "#c0caf5"
+cursor_text = "#1a1b26"
+selection_foreground = "#1a1b26"
+selection_background = "#7aa2f7"
+active_border = "#7aa2f7"
+inactive_border = "#3b4261"
+tab_bar_background = "#16161e"
+active_tab_foreground = "#1a1b26"
+active_tab_background = "#7aa2f7"
+inactive_tab_foreground = "#a9b1d6"
+inactive_tab_background = "#24283b"
+palette = ["#15161e", "#f7768e", "#9ece6a", "#e0af68", "#7aa2f7", "#bb9af7", "#7dcfff", "#a9b1d6",
+           "#414868", "#f7768e", "#9ece6a", "#e0af68", "#7aa2f7", "#bb9af7", "#7dcfff", "#c0caf5"]
+
+# Override / add / remove key bindings. "none" removes a default.
+[keybindings]
+# "kitty_mod+enter" = "vsplit"
+# "f5" = "none"
+# "ctrl+alt+left" = "neighboring_window_left"
