@@ -56,9 +56,14 @@ login_shell = false
 working_dir = ""
 inherit_working_dir = true
 
-# ---- bell
+# ---- bell & notifications
 bell = true
 visual_bell = false
+tab_activity_markers = true      # ● unseen output, 🔔 bell, ✗ failed command
+notify_on_bell = true            # desktop notification for bells in tabs you aren't looking at
+notify_command_seconds = 10      # notify when a long command finishes unseen (0 = off)
+notify_programs = true           # OSC 9 / OSC 777 notifications from programs
+shell_integration = true         # bash/zsh/fish: prompt jumps, copy last output, remote cwd
 
 # ---- session (restart / reboot)
 persist_scrollback = true
@@ -74,6 +79,7 @@ remote_install_helpers = true
 tab = true
 pane = true
 window = true                    # also offers "quit without saving"
+on_exit = true                   # ask when a shell exits by itself (exit / Ctrl+D)
 
 [dropdown]
 hotkey = "F12"                   # or a list: ["F1", "ctrl+alt+t"]
@@ -98,6 +104,15 @@ all_workspaces = true
 start_hidden = false
 start_fullscreen = false
 on_last_tab_exit = "new_tab_hide"  # new_tab_hide | new_tab | quit
+desktop_animation = false        # GNOME open/close animation (restart the dropdown)
+# color_scheme = "dracula"       # per-dropdown overrides
+# font_size = 12.0
+
+# A second dropdown with its own hotkey, size, colors and tabs:
+# [dropdowns.2]
+# hotkey = "shift+F1"
+# height = 0.6
+# color_scheme = "dracula"
 
 # Colors override the scheme (all optional):
 [colors]

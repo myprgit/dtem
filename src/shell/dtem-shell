@@ -1,0 +1,10 @@
+#!/bin/sh
+# dtem: start the login shell with dtem's shell integration (used by `dtem --remote`)
+d="$HOME/.local/share/dtem/shell"
+[ -n "$1" ] && cd "$1" 2>/dev/null
+case "$(basename "${SHELL:-/bin/sh}")" in
+  bash) DTEM_BASH_LOGIN=1 exec "$SHELL" --rcfile "$d/dtem.bash" -i ;;
+  zsh) DTEM_ORIG_ZDOTDIR="${ZDOTDIR-}" ZDOTDIR="$d/zsh" exec "$SHELL" -l ;;
+  fish) exec "$SHELL" -l --init-command "source '$d/dtem.fish'" ;;
+  *) exec "${SHELL:-/bin/sh}" -l ;;
+esac

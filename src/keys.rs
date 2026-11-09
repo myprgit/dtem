@@ -54,6 +54,10 @@ pub enum Action {
     Quit,
     QuitWithoutSaving,
     OpenSettings,
+    Hints,
+    PromptPrev,
+    PromptNext,
+    CopyLastOutput,
     None,
 }
 
@@ -119,6 +123,10 @@ impl Action {
             "quit" => Action::Quit,
             "quit_without_saving" => Action::QuitWithoutSaving,
             "open_settings" | "edit_config_file" => Action::OpenSettings,
+            "hints" | "open_url_hints" => Action::Hints,
+            "scroll_to_prompt_up" | "previous_prompt" => Action::PromptPrev,
+            "scroll_to_prompt_down" | "next_prompt" => Action::PromptNext,
+            "copy_last_command_output" | "copy_last_output" => Action::CopyLastOutput,
             "none" | "no_op" => Action::None,
             _ => return None,
         })
@@ -205,6 +213,10 @@ const DEFAULTS: &[(&str, &str)] = &[
     ("kitty_mod+f2", "open_settings"),
     ("ctrl+comma", "open_settings"),
     ("kitty_mod+alt+q", "quit"),
+    ("kitty_mod+e", "hints"),
+    ("kitty_mod+z", "previous_prompt"),
+    ("kitty_mod+x", "next_prompt"),
+    ("kitty_mod+g", "copy_last_command_output"),
 ];
 
 /// Every bindable action with a short description (used by the settings page).
@@ -248,6 +260,10 @@ pub const ACTIONS: &[(&str, &str)] = &[
     ("paste_from_clipboard", "Paste"),
     ("paste_from_selection", "Paste primary selection"),
     ("search", "Search in scrollback"),
+    ("hints", "Select link/path/hash with keyboard"),
+    ("previous_prompt", "Jump to previous prompt"),
+    ("next_prompt", "Jump to next prompt"),
+    ("copy_last_command_output", "Copy last command output"),
     ("scroll_line_up", "Scroll line up"),
     ("scroll_line_down", "Scroll line down"),
     ("scroll_page_up", "Scroll page up"),

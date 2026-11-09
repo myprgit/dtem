@@ -53,6 +53,17 @@ pub struct Pane {
     pub remote: Option<crate::remote::Remote>,
     /// Runs the settings page
     pub settings: bool,
+    /// kitty graphics images of this terminal
+    pub images: Arc<parking_lot::Mutex<crate::images::ImageStore>>,
+    pub geo: Arc<crate::stream::Geometry>,
+    /// Remote directory reported via OSC 7 (ssh sessions)
+    pub remote_cwd: Option<String>,
+    /// tab-bar markers
+    pub activity: bool,
+    pub bell: bool,
+    pub failed: bool,
+    pub cmd_started: Option<std::time::Instant>,
+    pub exit_code: Option<i32>,
 }
 
 pub struct SpawnOpts {
@@ -133,7 +144,16 @@ impl Pane {
                 args.push(script);
                 Some(tty::Shell::new(shell.clone(), args))
             }
-            _ => Some(tty::Shell::new(shell.clone(), if cfg.login_shell { vec!["-l".into()] } else { vec![] })),
+            _ => {
+                let integrated = if cfg.shell_integration { crate::shellint::launch(&shell, cfg.login_shell) } else { None };
+                match integrated {
+                    Some((args, extra_env)) => {
+                        env.extend(extra_env);
+                        Some(tty::Shell::new(shell.clone(), args))
+                    }
+                    None => Some(tty::Shell::new(shell.clone(), if cfg.login_shell { vec!["-l".into()] } else { vec![] })),
+                }
+            }
         };
         let topts = tty::Options { shell: shell_opt, working_directory: cwd.clone(), drain_on_exit: false, env };
         let ws = WindowSize {
@@ -149,6 +169,12 @@ impl Pane {
             pty.file().as_raw_fd()
         };
         let term = Arc::new(FairMutex::new(term));
+        let images = Arc::new(parking_lot::Mutex::new(crate::images::ImageStore::default()));
+        let geo = Arc::new(crate::stream::Geometry::default());
+        geo.cell_w.store(cell_w as u32, std::sync::atomic::Ordering::Relaxed);
+        geo.cell_h.store(cell_h as u32, std::sync::atomic::Ordering::Relaxed);
+        geo.cols.store(cols as u32, std::sync::atomic::Ordering::Relaxed);
+        let pty = crate::stream::FilteredPty::new(pty, id, listener.proxy.clone(), images.clone(), geo.clone())?;
         let el = EventLoop::new(term.clone(), listener, pty, false, false)?;
         let sender = el.channel();
         el.spawn();
@@ -165,6 +191,14 @@ impl Pane {
             dirty: true,
             last_cwd: cwd,
             exited: false,
+            images,
+            geo,
+            remote_cwd: None,
+            activity: false,
+            bell: false,
+            failed: false,
+            cmd_started: None,
+            exit_code: None,
             settings: opts.program.as_ref().map(|(_, a)| a.iter().any(|x| x.starts_with("--settings"))).unwrap_or(false),
             remote: opts.remote,
         })
@@ -177,6 +211,10 @@ impl Pane {
     pub fn resize(&mut self, cols: usize, rows: usize, cell_w: f32, cell_h: f32) {
         let cols = cols.max(2);
         let rows = rows.max(1);
+        use std::sync::atomic::Ordering::Relaxed;
+        self.geo.cell_w.store(cell_w as u32, Relaxed);
+        self.geo.cell_h.store(cell_h as u32, Relaxed);
+        self.geo.cols.store(cols as u32, Relaxed);
         if cols == self.cols && rows == self.rows {
             return;
         }
@@ -332,7 +370,8 @@ fn cell_sgr(cell: &Cell) -> String {
 }
 
 fn is_blank(cell: &Cell) -> bool {
-    (cell.c == ' ' || cell.c == '\0')
+    cell.c == crate::images::PLACEHOLDER
+        || (cell.c == ' ' || cell.c == '\0')
         && matches!(cell.bg, Color::Named(NamedColor::Background))
         && !cell.flags.intersects(Flags::INVERSE | Flags::ALL_UNDERLINES)
 }
@@ -376,12 +415,13 @@ pub fn serialize_grid<T: EventListener>(term: &Term<T>, max_lines: usize, skip_p
             if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
                 continue;
             }
-            let sgr = cell_sgr(cell);
+            let image_cell = cell.c == crate::images::PLACEHOLDER;
+            let sgr = if image_cell { "0".to_string() } else { cell_sgr(cell) };
             if sgr != cur_sgr {
                 let _ = write!(out, "\x1b[{sgr}m");
                 cur_sgr = sgr;
             }
-            out.push(if cell.c == '\0' { ' ' } else { cell.c });
+            out.push(if cell.c == '\0' || image_cell { ' ' } else { cell.c });
             if let Some(zw) = cell.zerowidth() {
                 out.extend(zw.iter());
             }

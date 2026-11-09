@@ -100,9 +100,19 @@ pub struct Config {
     pub working_dir: String,
     pub inherit_working_dir: bool,
 
-    // ---- bell
+    // ---- bell & notifications
     pub bell: bool,
     pub visual_bell: bool,
+    /// ● / 🔔 / ✗ markers on tabs with unseen output, bells or failed commands
+    pub tab_activity_markers: bool,
+    /// Desktop notification for a bell in a tab you aren't looking at
+    pub notify_on_bell: bool,
+    /// Notify when a command that ran at least this many seconds finishes unseen (0 = off; needs shell integration)
+    pub notify_command_seconds: u64,
+    /// Show notifications sent by programs (OSC 9 / OSC 777)
+    pub notify_programs: bool,
+    /// Load prompt/cwd integration into bash, zsh and fish automatically
+    pub shell_integration: bool,
 
     // ---- session
     pub persist_scrollback: bool,
@@ -118,6 +128,8 @@ pub struct Config {
 
     pub colors: Colors,
     pub dropdown: Dropdown,
+    /// Extra dropdowns: [dropdowns.2], [dropdowns.work], … (each with its own hotkey)
+    pub dropdowns: std::collections::BTreeMap<String, Dropdown>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -127,11 +139,13 @@ pub struct ConfirmClose {
     pub pane: bool,
     /// Closing a window / quitting
     pub window: bool,
+    /// When a shell exits by itself (`exit`, Ctrl+D): ask before closing the pane
+    pub on_exit: bool,
 }
 
 impl Default for ConfirmClose {
     fn default() -> Self {
-        Self { tab: true, pane: true, window: true }
+        Self { tab: true, pane: true, window: true, on_exit: true }
     }
 }
 
@@ -168,6 +182,11 @@ pub struct Dropdown {
     pub start_fullscreen: bool,
     /// When the last tab exits: "new_tab_hide" | "new_tab" | "quit"
     pub on_last_tab_exit: String,
+    /// Let the desktop (GNOME) animate the window when it opens/closes (X11; restart needed)
+    pub desktop_animation: bool,
+    /// Per-dropdown overrides
+    pub color_scheme: Option<String>,
+    pub font_size: Option<f32>,
 }
 
 impl Default for Dropdown {
@@ -195,6 +214,9 @@ impl Default for Dropdown {
             start_hidden: false,
             start_fullscreen: false,
             on_last_tab_exit: "new_tab_hide".into(),
+            desktop_animation: false,
+            color_scheme: None,
+            font_size: None,
         }
     }
 }
@@ -269,6 +291,11 @@ impl Default for Config {
             inherit_working_dir: true,
             bell: true,
             visual_bell: false,
+            tab_activity_markers: true,
+            notify_on_bell: true,
+            notify_command_seconds: 10,
+            notify_programs: true,
+            shell_integration: true,
             persist_scrollback: true,
             persist_scrollback_lines: 10_000,
             autosave_interval_secs: 5,
@@ -278,6 +305,7 @@ impl Default for Config {
             remote_install_helpers: true,
             colors: Colors::default(),
             dropdown: Dropdown::default(),
+            dropdowns: Default::default(),
         }
     }
 }
@@ -319,6 +347,14 @@ impl Config {
             .filter(|s| !s.trim().is_empty())
             .or_else(|| std::env::var("SHELL").ok())
             .unwrap_or_else(|| "/bin/bash".into())
+    }
+
+    /// Settings of a dropdown profile ("" = the default one).
+    pub fn dropdown_profile(&self, name: &str) -> Dropdown {
+        if name.is_empty() {
+            return self.dropdown.clone();
+        }
+        self.dropdowns.get(name).cloned().unwrap_or_else(|| Dropdown { hotkey: OneOrMany::One(String::new()), ..self.dropdown.clone() })
     }
 
     pub fn scrollback(&self) -> usize {

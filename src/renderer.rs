@@ -30,7 +30,8 @@ fn vs(@builtin(vertex_index) vi: u32,
   let p = pos + corner * size;
   var o: VOut;
   o.pos = vec4<f32>(p.x / u.screen.x * 2.0 - 1.0, 1.0 - p.y / u.screen.y * 2.0, 0.0, 1.0);
-  o.uv = (uv.xy + corner * uv.zw) / u.atlas;
+  let px_uv = uv.xy + corner * uv.zw;
+  o.uv = select(px_uv / u.atlas, px_uv, kind > 2.5);
   o.color = color;
   o.kind = kind;
   return o;
@@ -101,6 +102,12 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
+    bgl: wgpu::BindGroupLayout,
+    linear: wgpu::Sampler,
+    /// (pane, image id) -> (generation, texture, bind group)
+    img_cache: HashMap<(u64, u32), (u64, wgpu::Texture, wgpu::BindGroup)>,
+    /// image quads of this frame, grouped by image
+    img_insts: Vec<((u64, u32), Vec<Inst>)>,
     uniform: wgpu::Buffer,
     atlas: wgpu::Texture,
     inst_buf: wgpu::Buffer,
@@ -320,6 +327,14 @@ impl Renderer {
             config,
             pipeline,
             bind_group,
+            linear: device.create_sampler(&wgpu::SamplerDescriptor {
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            }),
+            bgl,
+            img_cache: HashMap::new(),
+            img_insts: Vec::new(),
             uniform,
             atlas,
             inst_buf,
@@ -506,6 +521,53 @@ impl Renderer {
         }
     }
 
+    /// Queue a slice of an image: `dst` in pixels, `uv` normalized (u0, v0, du, dv).
+    pub fn image(&mut self, gpu: &Gpu, key: (u64, u32), img: &crate::images::Image, dst: [f32; 4], uv: [f32; 4]) {
+        let fresh = self.img_cache.get(&key).map(|e| e.0 == img.version).unwrap_or(false);
+        if !fresh {
+            let tex = gpu.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("image"),
+                size: wgpu::Extent3d { width: img.w, height: img.h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            gpu.queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                &img.rgba,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(img.w * 4), rows_per_image: Some(img.h) },
+                wgpu::Extent3d { width: img.w, height: img.h, depth_or_array_layers: 1 },
+            );
+            let view = tex.create_view(&Default::default());
+            let bg = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: self.uniform.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&view) },
+                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.linear) },
+                ],
+            });
+            self.img_cache.insert(key, (img.version, tex, bg));
+        }
+        let inst = Inst { pos: [dst[0], dst[1]], size: [dst[2], dst[3]], uv, color: [1.0; 4], kind: 3.0 };
+        match self.img_insts.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, v)) => v.push(inst),
+            None => self.img_insts.push((key, vec![inst])),
+        }
+    }
+
+    /// Drop textures of images no longer shown (keeps GPU memory bounded).
+    fn gc_images(&mut self) {
+        if self.img_cache.len() > 32 {
+            let used: Vec<(u64, u32)> = self.img_insts.iter().map(|(k, _)| *k).collect();
+            self.img_cache.retain(|k, _| used.contains(k));
+        }
+    }
+
     /// Submit the frame. Returns false if the surface needs reconfiguration.
     pub fn present(&mut self, gpu: &Gpu, clear: Rgb) {
         if self.atlas_full {
@@ -519,15 +581,25 @@ impl Renderer {
                 self.surface.configure(&gpu.device, &self.config);
                 self.bg.clear();
                 self.fg.clear();
+                self.img_insts.clear();
                 return;
             }
             _ => {
                 self.bg.clear();
                 self.fg.clear();
+                self.img_insts.clear();
                 return;
             }
         };
         let mut all = std::mem::take(&mut self.bg);
+        let bg_len = all.len() as u32;
+        let mut img_ranges = Vec::new();
+        for (key, v) in self.img_insts.iter() {
+            let start = all.len() as u32;
+            all.extend_from_slice(v);
+            img_ranges.push((*key, start..all.len() as u32));
+        }
+        let fg_start = all.len() as u32;
         all.append(&mut self.fg);
         if all.len() > self.inst_cap {
             self.inst_cap = all.len().next_power_of_two();
@@ -561,9 +633,19 @@ impl Renderer {
                 pass.set_pipeline(&self.pipeline);
                 pass.set_bind_group(0, &self.bind_group, &[]);
                 pass.set_vertex_buffer(0, self.inst_buf.slice(..));
-                pass.draw(0..4, 0..all.len() as u32);
+                pass.draw(0..4, 0..bg_len);
+                for (key, range) in &img_ranges {
+                    if let Some((_, _, bgp)) = self.img_cache.get(key) {
+                        pass.set_bind_group(0, bgp, &[]);
+                        pass.draw(0..4, range.clone());
+                    }
+                }
+                pass.set_bind_group(0, &self.bind_group, &[]);
+                pass.draw(0..4, fg_start..all.len() as u32);
             }
         }
+        self.gc_images();
+        self.img_insts.clear();
         gpu.queue.submit(Some(enc.finish()));
         gpu.queue.present(frame);
         all.clear();

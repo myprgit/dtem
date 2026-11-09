@@ -92,31 +92,17 @@ fn sections() -> Vec<Section> {
                 v
             },
         },
+        Section { name: "Dropdown", items: dropdown_items("dropdown") },
+        Section { name: "Dropdown 2", items: dropdown_items("dropdowns.2") },
         Section {
-            name: "Dropdown",
+            name: "Notifications",
             items: vec![
-                it("dropdown.hotkey", "Hotkey(s)", Hotkeys, "comma separated, e.g. F1, ctrl+alt+t"),
-                it("dropdown.centered_horizontally", "Center horizontally", Bool, ""),
-                it("dropdown.centered_vertically", "Center vertically", Bool, ""),
-                it("dropdown.width", "Width", Percent(0.1, 1.0, 0.05), "% of the monitor width (←→ = 5%, or type e.g. 70)"),
-                it("dropdown.height", "Height", Percent(0.1, 1.0, 0.05), "% of the monitor height (←→ = 5%, or type e.g. 50)"),
-                it("dropdown.x", "X offset", Int(0, 10000, 10), "px inside the monitor (when not centered)"),
-                it("dropdown.y", "Y offset", Int(0, 10000, 10), "px inside the monitor (when not centered)"),
-                it("dropdown.monitor", "Initial monitor", Text, "e.g. DP-1; afterwards the last used monitor is remembered"),
-                it("dropdown.animation", "Slide animation", Bool, ""),
-                it("dropdown.animation_duration_ms", "Animation time", Int(30, 2000, 10), "ms"),
-                it("dropdown.animation_from", "Slide from", Choice(&["top", "bottom", "left", "right"]), ""),
-                it("dropdown.hide_on_focus_loss", "Hide on focus loss", Bool, ""),
-                it("dropdown.hide_on_mouse_leave", "Hide on mouse leave", Bool, ""),
-                it("dropdown.auto_hide_delay_ms", "Auto-hide delay", Int(0, 10000, 100), "ms"),
-                it("dropdown.unfocused_toggle", "Hotkey when unfocused", Choice(&["focus", "hide"]), "visible but not focused: focus it or hide it"),
-                it("dropdown.grab_focus", "Grab focus on show", Bool, ""),
-                it("dropdown.always_on_top", "Always on top", Bool, ""),
-                it("dropdown.skip_taskbar", "Hide from taskbar", Bool, ""),
-                it("dropdown.all_workspaces", "All workspaces", Bool, ""),
-                it("dropdown.start_hidden", "Start hidden", Bool, ""),
-                it("dropdown.start_fullscreen", "Start fullscreen", Bool, ""),
-                it("dropdown.on_last_tab_exit", "Last tab exits", Choice(&["new_tab_hide", "new_tab", "quit"]), ""),
+                it("tab_activity_markers", "Tab markers ● 🔔 ✗", Bool, "mark tabs with unseen output, bells, failed commands"),
+                it("notify_command_seconds", "Notify long commands", Int(0, 3600, 5), "seconds; 0 = off (needs shell integration)"),
+                it("notify_on_bell", "Notify on bell", Bool, "bell in a tab you aren't looking at"),
+                it("notify_programs", "Program notifications", Bool, "OSC 9 / OSC 777 from programs"),
+                it("bell", "Bell", Bool, ""),
+                it("visual_bell", "Visual bell", Bool, ""),
             ],
         },
         Section {
@@ -135,8 +121,6 @@ fn sections() -> Vec<Section> {
                 it("open_url_with", "Open links with", Text, ""),
                 it("backspace_sends", "Backspace sends", Choice(&["auto", "del", "bs", "escape"]), ""),
                 it("delete_sends", "Delete sends", Choice(&["escape", "del", "bs", "auto"]), ""),
-                it("bell", "Bell", Bool, ""),
-                it("visual_bell", "Visual bell", Bool, ""),
                 it("ime", "Input method (IME)", Bool, ""),
                 it("kitty_keyboard", "Kitty keyboard protocol", Bool, ""),
                 it("clipboard_read", "Programs reading clipboard", Choice(&["ask", "allow", "deny"]), "OSC 52"),
@@ -146,6 +130,7 @@ fn sections() -> Vec<Section> {
             name: "Shell & titles",
             items: vec![
                 it("shell", "Shell", Text, "empty = $SHELL"),
+                it("shell_integration", "Shell integration", Bool, "prompt jumps, last output copy, command notifications, remote cwd (new tabs)"),
                 it("login_shell", "Login shell", Bool, ""),
                 it("command", "Command for new tabs", Text, "empty = just the shell"),
                 it("command_exit", "When command exits", Choice(&["shell", "restart", "close"]), ""),
@@ -167,6 +152,7 @@ fn sections() -> Vec<Section> {
                 it("confirm_close.tab", "Confirm closing tab", Bool, ""),
                 it("confirm_close.pane", "Confirm closing pane", Bool, ""),
                 it("confirm_close.window", "Confirm quit / window", Bool, ""),
+                it("confirm_close.on_exit", "Ask when the shell exits", Bool, "after `exit` / Ctrl+D: close, restart or keep"),
                 it("remote_install_helpers", "Install dtem-copy on ssh", Bool, ""),
                 it("force_x11", "Force X11 (Wayland)", Bool, "restart needed"),
             ],
@@ -177,6 +163,43 @@ fn sections() -> Vec<Section> {
         items: keys::ACTIONS.iter().map(|(a, d)| it("keybindings", d, Binding(a), "comma separated combos, e.g. ctrl+shift+t, f5")).collect(),
     });
     v
+}
+
+fn dropdown_items(p: &str) -> Vec<Item> {
+    use Kind::*;
+    let f = |k: &str| format!("{p}.{k}");
+    let first = if p == "dropdown" {
+        it(&f("hotkey"), "Hotkey(s)", Hotkeys, "comma separated, e.g. F1, ctrl+alt+t")
+    } else {
+        it(&f("hotkey"), "Hotkey(s)", Hotkeys, "e.g. shift+F1 — setting a key creates this second dropdown")
+    };
+    vec![
+        first,
+        it(&f("centered_horizontally"), "Center horizontally", Bool, ""),
+        it(&f("centered_vertically"), "Center vertically", Bool, ""),
+        it(&f("width"), "Width", Percent(0.1, 1.0, 0.05), "% of the monitor width (←→ = 5%, or type e.g. 70)"),
+        it(&f("height"), "Height", Percent(0.1, 1.0, 0.05), "% of the monitor height (←→ = 5%, or type e.g. 50)"),
+        it(&f("x"), "X offset", Int(0, 10000, 10), "px inside the monitor (when not centered)"),
+        it(&f("y"), "Y offset", Int(0, 10000, 10), "px inside the monitor (when not centered)"),
+        it(&f("monitor"), "Initial monitor", Text, "e.g. DP-1; afterwards the last used monitor is remembered"),
+        it(&f("color_scheme"), "Color scheme", Text, "empty = global scheme (Tab completes)"),
+        it(&f("font_size"), "Font size", Float(5.0, 48.0, 0.5), "empty = global font size"),
+        it(&f("desktop_animation"), "Desktop open/close animation", Bool, "GNOME's window animation (restart the dropdown)"),
+        it(&f("animation"), "Slide animation", Bool, "dtem's own slide-in"),
+        it(&f("animation_duration_ms"), "Slide time", Int(30, 2000, 10), "ms"),
+        it(&f("animation_from"), "Slide from", Choice(&["top", "bottom", "left", "right"]), ""),
+        it(&f("hide_on_focus_loss"), "Hide on focus loss", Bool, ""),
+        it(&f("hide_on_mouse_leave"), "Hide on mouse leave", Bool, ""),
+        it(&f("auto_hide_delay_ms"), "Auto-hide delay", Int(0, 10000, 100), "ms"),
+        it(&f("unfocused_toggle"), "Hotkey when unfocused", Choice(&["focus", "hide"]), "visible but not focused: focus it or hide it"),
+        it(&f("grab_focus"), "Grab focus on show", Bool, ""),
+        it(&f("always_on_top"), "Always on top", Bool, ""),
+        it(&f("skip_taskbar"), "Hide from taskbar", Bool, ""),
+        it(&f("all_workspaces"), "All workspaces", Bool, ""),
+        it(&f("start_hidden"), "Start hidden", Bool, ""),
+        it(&f("start_fullscreen"), "Start fullscreen", Bool, ""),
+        it(&f("on_last_tab_exit"), "Last tab exits", Choice(&["new_tab_hide", "new_tab", "quit"]), ""),
+    ]
 }
 
 fn lookup<'a>(v: &'a toml::Value, path: &str) -> Option<&'a toml::Value> {
@@ -303,6 +326,22 @@ impl App {
         self.theme = Theme::from_config(&self.cfg);
     }
 
+    /// Effective value: config value, or the default for a not-yet-created dropdown profile.
+    fn eff_value(&self, path: &str) -> Option<toml::Value> {
+        if let Some(v) = lookup(&self.eff, path) {
+            return Some(v.clone());
+        }
+        let rest = path.strip_prefix("dropdowns.")?;
+        let (_, key) = rest.split_once('.')?;
+        let d = toml::Value::try_from(crate::config::Dropdown::default()).ok()?;
+        let v = lookup(&d, key)?.clone();
+        // a profile without its own hotkey has none (not the default F12)
+        if key == "hotkey" {
+            return Some(toml::Value::String(String::new()));
+        }
+        Some(v)
+    }
+
     fn item(&self) -> Option<&Item> {
         let i = self.sel[self.tab].selected()?;
         self.sections[self.tab].items.get(i)
@@ -313,7 +352,7 @@ impl App {
             Kind::Binding(a) => keys::effective_combos(&self.cfg, a).join(", "),
             Kind::Palette(i) => hex(self.theme.table[*i]),
             Kind::Percent(..) => {
-                let f = lookup(&self.eff, &item.path).and_then(|v| v.as_float()).unwrap_or(0.0);
+                let f = self.eff_value(&item.path).and_then(|v| v.as_float()).unwrap_or(0.0);
                 format!("{}%", (f * 100.0).round())
             }
             Kind::Color => {
@@ -337,7 +376,7 @@ impl App {
                     v
                 }
             }
-            _ => display(lookup(&self.eff, &item.path)),
+            _ => display(self.eff_value(&item.path).as_ref()),
         }
     }
 
@@ -531,7 +570,7 @@ impl App {
                 self.set_value(item, &format!("{v:.3}"));
             }
             Kind::Percent(_, _, step) => {
-                let f = lookup(&self.eff, &item.path).and_then(|v| v.as_float()).unwrap_or(0.5);
+                let f = self.eff_value(&item.path).and_then(|v| v.as_float()).unwrap_or(0.5);
                 let v = ((f + dir as f64 * step) * 100.0).round();
                 self.set_value(item, &format!("{v}%"));
             }
@@ -661,7 +700,8 @@ impl App {
             (_, Kind::Hotkeys) | (_, Kind::Binding(_)) => return KEY_NAMES.iter().map(|s| s.to_string()).collect(),
             ("font_family", _) if path_like => return path_cands(token),
             ("font_family", _) => "fonts",
-            ("dropdown.monitor", _) => "monitors",
+            (p, _) if p.ends_with(".monitor") => "monitors",
+            (p, _) if p.ends_with("color_scheme") => return schemes::NAMES.iter().map(|s| s.to_string()).collect(),
             ("shell", _) => "shells",
             ("open_url_with", _) => "browsers",
             ("working_dir", _) | ("command", _) if path_like => return path_cands(token),

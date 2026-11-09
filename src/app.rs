@@ -1,4 +1,6 @@
 //! Application: OS windows, tabs, split panes, input, rendering, dropdown & session handling.
+mod extras;
+use extras::{hint_regexes, HintKind, Hints};
 use crate::config::{Config, Rgb, Theme};
 use crate::font::{self, FontSet};
 use crate::keys::{self, Action, Bindings};
@@ -36,14 +38,6 @@ pub enum Role {
     Dropdown,
 }
 
-impl Role {
-    pub fn name(&self) -> &'static str {
-        match self {
-            Role::Main => "main",
-            Role::Dropdown => "dropdown",
-        }
-    }
-}
 
 pub struct Startup {
     pub restore: bool,
@@ -61,6 +55,8 @@ enum Confirm {
     ClipRead(u64),
     Quit,
     QuitNoSave,
+    /// The shell of this pane exited by itself
+    Exited(u64),
 }
 
 struct Tab {
@@ -94,6 +90,7 @@ struct OsWin {
     scroll_drag: Option<u64>,
     bell_at: Option<Instant>,
     menu: Option<Menu>,
+    hints: Option<Hints>,
     /// Dropdown: fullscreen state when it was last hidden (restored on show)
     was_fullscreen: bool,
     cursor: (f64, f64),
@@ -150,6 +147,11 @@ pub struct App {
     last_input: Instant,
     discard_session: bool,
     installed_hotkeys: Vec<String>,
+    /// Dropdown profile ("" = default, otherwise a key of [dropdowns])
+    profile: String,
+    hint_res: Vec<(HintKind, regex::Regex)>,
+    /// global hotkey id → dropdown profile it toggles
+    hotkey_targets: Arc<parking_lot::Mutex<HashMap<u32, String>>>,
     /// touchpad ctrl+scroll accumulator (pixels)
     zoom_acc: f64,
     last_wheel: Option<(Instant, bool)>,
@@ -180,11 +182,11 @@ fn dim(c: Rgb) -> Rgb {
 }
 
 impl App {
-    pub fn new(cfg: Config, role: Role, proxy: EventLoopProxy<UserEvent>, startup: Startup) -> anyhow::Result<App> {
+    pub fn new(cfg: Config, role: Role, profile: String, proxy: EventLoopProxy<UserEvent>, startup: Startup) -> anyhow::Result<App> {
         let fonts = FontSet::new(&cfg.font_family)?;
         Ok(App {
             bindings: Bindings::new(&cfg),
-            theme: Theme::from_config(&cfg),
+            theme: profile_theme(&cfg, role, &profile),
             keycfg: keys::KeyCfg::from_config(&cfg),
             transparency_on: cfg.transparency,
             url_re: build_url_regex(&cfg),
@@ -195,6 +197,9 @@ impl App {
             last_input: Instant::now(),
             discard_session: false,
             installed_hotkeys: Vec::new(),
+            profile: profile.clone(),
+            hint_res: hint_regexes(),
+            hotkey_targets: Default::default(),
             zoom_acc: 0.0,
             last_wheel: None,
             cfg,
@@ -221,6 +226,20 @@ impl App {
             last_focused: None,
             exiting: false,
         })
+    }
+
+    /// Name used for the session file and IPC socket.
+    pub(super) fn rname(&self) -> String {
+        match (self.role, self.profile.as_str()) {
+            (Role::Main, _) => "main".into(),
+            (Role::Dropdown, "") => "dropdown".into(),
+            (Role::Dropdown, p) => format!("dropdown-{p}"),
+        }
+    }
+
+    /// This dropdown's settings.
+    pub(super) fn dd(&self) -> crate::config::Dropdown {
+        self.cfg.dropdown_profile(&self.profile)
     }
 
     fn alloc_id(&mut self) -> u64 {
@@ -256,7 +275,7 @@ impl App {
             // Broken/unknown monitor info: use a sane default instead of a 0-sized window.
             s = PhysicalSize::new(1280, 800);
         }
-        let d = &self.cfg.dropdown;
+        let d = self.dd();
         let w = ((s.width as f32) * d.width.clamp(0.1, 1.0)) as u32;
         let h = ((s.height as f32) * d.height.clamp(0.1, 1.0)) as u32;
         let x = if d.centered_horizontally { (s.width as i32 - w as i32) / 2 } else { d.x.min(s.width as i32 - w as i32).max(0) };
@@ -277,7 +296,7 @@ impl App {
         }
         let mut monitor_name = ws
             .and_then(|w| w.monitor.clone())
-            .or_else(|| Some(self.cfg.dropdown.monitor.clone()).filter(|m| dropdown && !m.is_empty()));
+            .or_else(|| Some(self.dd().monitor.clone()).filter(|m| dropdown && !m.is_empty()));
         if dropdown {
             let mon = Self::monitor_by_name(el, monitor_name.as_deref()).or_else(|| Self::fallback_monitor(el));
             if let Some(m) = &mon {
@@ -286,7 +305,12 @@ impl App {
                 monitor_name = m.name();
             }
             attrs = attrs.with_decorations(false).with_visible(false);
-            if self.cfg.dropdown.always_on_top {
+            if !self.dd().desktop_animation {
+                // GNOME Shell only animates normal/dialog windows when they map/unmap
+                use winit::platform::x11::{WindowAttributesExtX11, WindowType};
+                attrs = attrs.with_x11_window_type(vec![WindowType::Utility]);
+            }
+            if self.dd().always_on_top {
                 attrs = attrs.with_window_level(WindowLevel::AlwaysOnTop);
             }
         } else {
@@ -319,7 +343,7 @@ impl App {
                 self.x11 = crate::x11::X11::connect();
             }
             if let (Some(x), Some(id)) = (&self.x11, crate::x11::window_id(&window)) {
-                let d = &self.cfg.dropdown;
+                let d = self.dd();
                 x.preset(id, d.skip_taskbar, d.all_workspaces, d.always_on_top);
             }
         }
@@ -353,7 +377,8 @@ impl App {
             self.clip = Some(make_clipboard(&window));
         }
         let scale = window.scale_factor();
-        let font_size = ws.and_then(|w| w.font_size).unwrap_or(self.cfg.font_size);
+        let base_font = if dropdown { self.dd().font_size.unwrap_or(self.cfg.font_size) } else { self.cfg.font_size };
+        let font_size = ws.and_then(|w| w.font_size).unwrap_or(base_font);
         let metrics = font::cell_metrics(&self.fonts, pt_to_px(font_size, scale), self.cfg.line_height);
         let size = window.inner_size();
         let renderer = Renderer::new(
@@ -390,7 +415,8 @@ impl App {
                 scroll_drag: None,
                 bell_at: None,
                 menu: None,
-                was_fullscreen: dropdown && (ws.map(|w| w.fullscreen).unwrap_or(false) || self.cfg.dropdown.start_fullscreen),
+                hints: None,
+                was_fullscreen: dropdown && (ws.map(|w| w.fullscreen).unwrap_or(false) || self.dd().start_fullscreen),
                 cursor: (0.0, 0.0),
                 left_down: false,
                 selecting: None,
@@ -496,9 +522,9 @@ impl App {
         let mut specs: Vec<(u64, SpawnOpts)> = Vec::new();
         fn build(app: &mut App, n: &SNode, specs: &mut Vec<(u64, SpawnOpts)>, restore: bool) -> Node {
             match n {
-                SNode::Leaf { cwd, command, scrollback, title, remote } => {
+                SNode::Leaf { cwd, command, scrollback, title, remote, remote_cwd } => {
                     let id = app.alloc_id();
-                    let remote = remote.clone().map(Remote::new_multiplexed);
+                    let remote = remote.clone().map(|a| Remote { cwd: remote_cwd.clone(), ..Remote::new_multiplexed(a) });
                     let program = remote.as_ref().map(|r| {
                         // restored remote panes ask before reconnecting (programs aren't restarted)
                         ("/bin/sh".to_string(), vec!["-c".to_string(), r.pane_script(restore)])
@@ -507,7 +533,7 @@ impl App {
                         app.ensure_remote_helpers(r);
                     }
                     let restore_bytes = if restore && app.cfg.persist_scrollback {
-                        scrollback.as_ref().and_then(|s| session::read_scrollback(app.role.name(), s))
+                        scrollback.as_ref().and_then(|s| session::read_scrollback(&app.rname(), s))
                     } else {
                         None
                     };
@@ -568,6 +594,7 @@ impl App {
                 scrollback: None,
                 title: None,
                 remote: None,
+                remote_cwd: None,
             },
         };
         self.add_tab_from_state(wid, &ts, false, at);
@@ -649,7 +676,7 @@ impl App {
         let Some(win) = self.windows.get(&wid) else { return };
         if win.tabs.is_empty() {
             if win.dropdown {
-                match self.cfg.dropdown.on_last_tab_exit.as_str() {
+                match self.dd().on_last_tab_exit.as_str() {
                     "quit" => {
                         self.save_session(true);
                         self.exiting = true;
@@ -725,7 +752,7 @@ impl App {
             Confirm::Tab(_) => cc.tab,
             Confirm::Pane(_) => cc.pane,
             Confirm::Window | Confirm::Quit | Confirm::QuitNoSave => cc.window,
-            Confirm::ClipRead(_) => true,
+            Confirm::ClipRead(_) | Confirm::Exited(_) => true,
         };
         if !ask {
             self.execute_close(el, wid, c);
@@ -752,6 +779,7 @@ impl App {
             }
             Confirm::Quit => self.quit(el, false),
             Confirm::QuitNoSave => self.quit(el, true),
+            Confirm::Exited(id) => self.close_pane(el, id),
             Confirm::Window => {
                 let normal_windows = self.windows.values().filter(|w| !w.dropdown).count();
                 if normal_windows == 1 && self.role == Role::Main {
@@ -769,7 +797,8 @@ impl App {
     /// Quit the whole instance. `discard`: forget the session (next start is fresh).
     fn quit(&mut self, el: &ActiveEventLoop, discard: bool) {
         if discard {
-            let role = self.role.name();
+            let role_name = self.rname();
+        let role = role_name.as_str();
             let _ = std::fs::remove_file(session::session_path(role));
             let _ = std::fs::remove_dir_all(session::scrollback_dir(role));
             self.discard_session = true;
@@ -795,6 +824,13 @@ impl App {
         match c {
             Confirm::Quit => format!("Quit dtem? ({tabs_all} tabs — restored on next start)"),
             Confirm::QuitNoSave => "Quit and FORGET the session? (next start is empty)".to_string(),
+            Confirm::Exited(id) => {
+                let code = self.panes.get(&id).and_then(|p| p.exit_code);
+                match code {
+                    Some(c) if c != 0 => format!("The shell exited (code {c}). Close this pane?"),
+                    _ => "The shell exited. Close this pane?".to_string(),
+                }
+            }
             Confirm::Tab(i) => {
                 let n = win.tabs.get(i).map(|t| t.root.leaf_list().len()).unwrap_or(1);
                 if n > 1 {
@@ -843,7 +879,7 @@ impl App {
     fn show_dropdown(&mut self, el: &ActiveEventLoop, wid: WindowId) {
         self.pending_hide = None;
         self.apply_dropdown_geometry(el, wid);
-        let d = self.cfg.dropdown.clone();
+        let d = self.dd();
         let name = self.windows.get(&wid).and_then(|w| w.monitor.clone());
         let mon = Self::monitor_by_name(el, name.as_deref()).or_else(|| Self::fallback_monitor(el));
         let target = mon.as_ref().map(|m| self.dropdown_geometry(m));
@@ -888,6 +924,7 @@ impl App {
 
     fn hide_dropdown(&mut self, wid: WindowId) {
         self.pending_hide = None;
+        let d = self.dd();
         let Some(win) = self.windows.get_mut(&wid) else { return };
         if win.visible {
             win.was_fullscreen = win.window.fullscreen().is_some();
@@ -899,14 +936,14 @@ impl App {
                 return;
             }
         }
-        if self.cfg.dropdown.animation && win.visible && self.anim.is_none() {
+        if d.animation && win.visible && self.anim.is_none() {
             if let (Ok(pos), Some(m)) = (win.window.outer_position(), win.window.current_monitor()) {
                 let size = win.window.outer_size();
-                let to = offscreen(&self.cfg.dropdown.animation_from, &m, pos, size);
+                let to = offscreen(&d.animation_from, &m, pos, size);
                 self.anim = Some(Anim {
                     wid,
                     start: Instant::now(),
-                    dur: Duration::from_millis(self.cfg.dropdown.animation_duration_ms.max(1)),
+                    dur: Duration::from_millis(d.animation_duration_ms.max(1)),
                     from: (pos.x, pos.y),
                     to: (to.x, to.y),
                     hide: true,
@@ -963,7 +1000,7 @@ impl App {
         // focus right before our toggle arrives. Treat such a recent loss as "focused".
         let lost_to_hotkey = win.unfocused_at.map(|t| t.elapsed() < Duration::from_millis(700)).unwrap_or(false);
         let recently_tried = self.focus_try.map(|t| t.elapsed() < Duration::from_secs(3)).unwrap_or(false);
-        let hide_unfocused = self.cfg.dropdown.unfocused_toggle == "hide";
+        let hide_unfocused = self.dd().unfocused_toggle == "hide";
         if !win.visible {
             self.focus_try = None;
             self.show_dropdown(el, wid);
@@ -1040,15 +1077,17 @@ impl App {
     fn snode(&mut self, n: &Node) -> SNode {
         match n {
             Node::Leaf(id) => {
-                let (cwd, sb, remote) = match self.panes.get_mut(id) {
-                    Some(p) => (
-                        p.cwd().map(|c| c.display().to_string()),
-                        Some(p.persist_id.clone()),
-                        p.remote.as_ref().map(|r| r.args.clone()),
-                    ),
-                    None => (None, None, None),
+                let (cwd, sb, remote, remote_cwd) = match self.panes.get_mut(id) {
+                    Some(p) => {
+                        // a pane running our multiplexed ssh (inline `dtem --remote`) is saved
+                        // as a remote pane, so it offers to reconnect after a restart
+                        let r = p.remote.clone().or_else(|| p.remote_target().filter(|r| r.multiplexed));
+                        let rc = if r.is_some() { p.remote_cwd.clone() } else { None };
+                        (p.cwd().map(|c| c.display().to_string()), Some(p.persist_id.clone()), r.map(|r| r.args), rc)
+                    }
+                    None => (None, None, None, None),
                 };
-                SNode::Leaf { cwd, command: None, scrollback: sb, title: None, remote }
+                SNode::Leaf { cwd, command: None, scrollback: sb, title: None, remote, remote_cwd }
             }
             Node::Split { vertical, ratio, a, b } => SNode::Split {
                 vertical: *vertical,
@@ -1061,7 +1100,8 @@ impl App {
 
     pub fn save_session(&mut self, force: bool) {
         self.last_save = Instant::now();
-        let role = self.role.name();
+        let role_name = self.rname();
+        let role = role_name.as_str();
         let mut keep = Vec::new();
         if self.cfg.persist_scrollback {
             let max = self.cfg.persist_scrollback_lines;
@@ -1381,7 +1421,7 @@ impl App {
             Action::ReloadConfig => {
                 self.cfg = Config::load();
                 self.bindings = Bindings::new(&self.cfg);
-                self.theme = Theme::from_config(&self.cfg);
+                self.theme = profile_theme(&self.cfg, self.role, &self.profile);
                 for w in self.windows.values() {
                     w.window.request_redraw();
                 }
@@ -1410,6 +1450,10 @@ impl App {
             Action::Quit => self.request_close(el, wid, Confirm::Quit),
             Action::QuitWithoutSaving => self.request_close(el, wid, Confirm::QuitNoSave),
             Action::OpenSettings => self.open_settings_tab(el, wid, None),
+            Action::Hints => self.start_hints(wid),
+            Action::PromptPrev => self.jump_prompt(wid, false),
+            Action::PromptNext => self.jump_prompt(wid, true),
+            Action::CopyLastOutput => self.copy_last_output(wid),
             Action::None => {}
         }
     }
@@ -1523,8 +1567,33 @@ impl App {
         if self.windows.get(&wid).map(|w| w.menu.is_some()).unwrap_or(false) && self.menu_key(el, wid, &ev) {
             return;
         }
+        if self.windows.get(&wid).map(|w| w.hints.is_some()).unwrap_or(false) && self.hints_key(wid, &ev) {
+            return;
+        }
         // Close confirmation prompt
         if let Some(c) = self.windows.get(&wid).and_then(|w| w.confirm) {
+            if let Confirm::Exited(id) = c {
+                match &ev.logical_key {
+                    Key::Named(NamedKey::Shift | NamedKey::Control | NamedKey::Alt | NamedKey::Super) => return,
+                    Key::Character(s) if s.eq_ignore_ascii_case("r") => {
+                        self.windows.get_mut(&wid).unwrap().confirm = None;
+                        self.restart_pane(wid, id);
+                    }
+                    Key::Named(NamedKey::Enter) => {
+                        self.windows.get_mut(&wid).unwrap().confirm = None;
+                        self.close_pane(el, id);
+                    }
+                    Key::Character(s) if s.eq_ignore_ascii_case("y") => {
+                        self.windows.get_mut(&wid).unwrap().confirm = None;
+                        self.close_pane(el, id);
+                    }
+                    _ => self.windows.get_mut(&wid).unwrap().confirm = None,
+                }
+                if let Some(w) = self.windows.get(&wid) {
+                    w.window.request_redraw();
+                }
+                return;
+            }
             if matches!(&ev.logical_key, Key::Character(s) if s.eq_ignore_ascii_case("d")) && self.confirm_is_quit(c) {
                 self.windows.get_mut(&wid).unwrap().confirm = None;
                 self.quit(el, true);
@@ -1948,11 +2017,17 @@ impl App {
     // ------------------------------------------------------------------ rendering
 
     fn render(&mut self, wid: WindowId) {
+        self.clear_attended(wid);
+        let markers: Vec<&'static str> =
+            self.windows.get(&wid).map(|w| w.tabs.iter().map(|t| self.tab_marker(t)).collect()).unwrap_or_default();
         let last_input = self.last_input;
         let tab_bar_h = self.windows.get(&wid).map(|w| self.tab_bar_height(w)).unwrap_or(0.0);
+        let tb_h_pre = tab_bar_h;
         let confirm_text = self.windows.get(&wid).and_then(|w| w.confirm).map(|c| {
             let hint = if matches!(c, Confirm::ClipRead(_)) {
                 "[y] allow once   [a] always   [n] deny"
+            } else if matches!(c, Confirm::Exited(_)) {
+                "[Enter] close   [r] restart shell   [Esc] keep it open"
             } else if self.confirm_is_quit(c) {
                 "[y/Enter] quit   [d] quit without saving   [n/Esc] cancel"
             } else {
@@ -2027,6 +2102,7 @@ impl App {
             let oy = r.y + pad;
             let mut row_buf: Vec<RCell> = Vec::with_capacity(pane.cols);
             let mut cur_row = i32::MIN;
+            let imgs = pane.images.lock();
             for ind in content.display_iter {
                 let cell = ind.cell;
                 if cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
@@ -2041,6 +2117,27 @@ impl App {
                 }
                 let x = ox + col as f32 * m.width;
                 let y = oy + row as f32 * m.height;
+                // kitty graphics placeholder cell: draw its slice of the image
+                if cell.c == crate::images::PLACEHOLDER {
+                    if let (Color::Spec(f), Color::Spec(b)) = (cell.fg, cell.bg) {
+                        let (key, irow, icol) = crate::images::decode_cell([f.r, f.g, f.b], [b.r, b.g, b.b]);
+                        if let Some(pl) = imgs.placements.get(&key) {
+                            if let Some(img) = imgs.images.get(&pl.image) {
+                                // fit the image into its cell box, keeping the aspect ratio
+                                let (bw, bh) = (pl.cols as f32 * m.width, pl.rows as f32 * m.height);
+                                let sc = (bw / img.w as f32).min(bh / img.h as f32);
+                                let (dw, dh) = (img.w as f32 * sc, img.h as f32 * sc);
+                                let (x0, y0) = (icol as f32 * m.width, irow as f32 * m.height);
+                                let (x1, y1) = ((x0 + m.width).min(dw), (y0 + m.height).min(dh));
+                                if x1 > x0 && y1 > y0 {
+                                    let uv = [x0 / dw, y0 / dh, (x1 - x0) / dw, (y1 - y0) / dh];
+                                    win.renderer.image(gpu, (*id, pl.image), img, [x, y, x1 - x0, y1 - y0], uv);
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let fg_color = match cell.fg {
                     Color::Named(n) if cfg.bold_is_bright && cell.flags.contains(Flags::BOLD) && (n as usize) < 8 => {
                         Color::Indexed(n as u8 + 8)
@@ -2102,6 +2199,7 @@ impl App {
                     win.renderer.rect_top(x, y + (m.height / 2.0).round(), cw, m.thickness, fgc);
                 }
             }
+            drop(imgs);
             draw_row(&mut win.renderer, gpu, fonts, &row_buf, ox, oy + cur_row as f32 * m.height, cfg.ligatures);
             // Cursor
             let crow = cursor.point.line.0 + offset;
@@ -2147,6 +2245,36 @@ impl App {
                     }
                 }
             }
+        }
+
+        // Keyboard hints
+        if let Some(h) = &win.hints {
+            if let Some((_, r)) = rects.iter().find(|(id, _)| *id == h.pane) {
+                if let Some(pane) = panes.get(&h.pane) {
+                    let off = pane.term.lock().grid().display_offset() as i32;
+                    let (ox, oy) = (r.x + pad, r.y + pad);
+                    for it in h.items.iter().filter(|i| i.label.starts_with(&h.typed)) {
+                        let row = it.line.0 + off;
+                        if row < 0 || row as usize >= pane.rows {
+                            continue;
+                        }
+                        let y = oy + row as f32 * m.height;
+                        let x = ox + it.start as f32 * m.width;
+                        let w = (it.end + 1 - it.start) as f32 * m.width;
+                        win.renderer.rect_top(x, y + m.height - m.thickness, w, m.thickness, rgba(theme.search_match, 1.0));
+                        let label = it.label.to_uppercase();
+                        let lw = label.chars().count() as f32 * m.width;
+                        win.renderer.rect_top(x, y, lw, m.height, rgba(theme.search_match, 1.0));
+                        win.renderer.text(gpu, fonts, &label, x, y, lw + 1.0, rgba(theme.table[257], 1.0));
+                    }
+                }
+            }
+            let (_, wh) = win.renderer.size();
+            let bh = m.height + 6.0;
+            let by = if cfg.tab_bar_position == "bottom" { wh - tb_h_pre - bh } else { wh - bh };
+            win.renderer.rect_top(0.0, by, ww, bh, rgba(theme.tab_bar_bg, 1.0));
+            let txt = format!("Hints {}▏  letter: open link / copy   Shift+letter: paste into terminal   Esc: cancel", h.typed.to_uppercase());
+            win.renderer.text(gpu, fonts, &txt, m.width, by + 3.0, ww - m.width, rgba(theme.table[256], 1.0));
         }
 
         // Scrollbars
@@ -2212,7 +2340,8 @@ impl App {
             let z = if t.zoomed { " [Z]" } else { "" };
             let n = t.root.leaf_list().len();
             let count = if n > 1 { format!(" ({n})") } else { String::new() };
-            titles.push(format!("{}: {}{}{}", i + 1, base, count, z));
+            let mark = markers.get(i).copied().unwrap_or("");
+            titles.push(format!("{}: {mark}{}{}{}", i + 1, base, count, z));
         }
         if tb_h > 0.0 {
             win.renderer.rect(0.0, bar_y, ww, tb_h, rgba(theme.tab_bar_bg, 1.0));
@@ -2339,8 +2468,15 @@ impl App {
         let wid = self.pane_win.get(&id).copied();
         match ev {
             TermEvent::Wakeup => {
+                let attended = self.attended(id);
                 if let Some(p) = self.panes.get_mut(&id) {
                     p.dirty = true;
+                    if !attended && !p.activity {
+                        p.activity = true;
+                        if let Some(w) = wid.and_then(|w| self.windows.get(&w)) {
+                            w.window.request_redraw();
+                        }
+                    }
                     if self.cfg.scroll_on_output {
                         let mut t = p.term.lock();
                         if t.grid().display_offset() > 0 {
@@ -2425,6 +2561,17 @@ impl App {
                 }
             }
             TermEvent::Bell => {
+                if !self.attended(id) {
+                    if let Some(p) = self.panes.get_mut(&id) {
+                        p.bell = true;
+                    }
+                    if self.cfg.notify_on_bell {
+                        self.notify(id, "", "🔔 Bell — waiting for you?");
+                    }
+                    if let Some(w) = wid.and_then(|w| self.windows.get(&w)) {
+                        w.window.request_redraw();
+                    }
+                }
                 if !self.cfg.bell {
                     return;
                 }
@@ -2448,10 +2595,14 @@ impl App {
                 }
             }
             TermEvent::ChildExit(_) | TermEvent::Exit => {
+                let code = match &ev {
+                    TermEvent::ChildExit(st) => st.code(),
+                    _ => None,
+                };
                 if let Some(p) = self.panes.get_mut(&id) {
                     if !p.exited {
                         p.exited = true;
-                        self.close_pane(el, id);
+                        self.pane_exited(el, id, code);
                     }
                 }
             }
@@ -2462,7 +2613,7 @@ impl App {
     fn startup(&mut self, el: &ActiveEventLoop) {
         let Some(st) = self.startup.take() else { return };
         if st.restore {
-            if let Some(s) = session::load(&session::session_path(self.role.name())) {
+            if let Some(s) = session::load(&session::session_path(&self.rname())) {
                 self.open_session(el, &s, true);
             }
         }
@@ -2514,9 +2665,11 @@ impl App {
             match global_hotkey::GlobalHotKeyManager::new() {
                 Ok(m) => {
                     let proxy = self.proxy.clone();
+                    let targets = self.hotkey_targets.clone();
                     global_hotkey::GlobalHotKeyEvent::set_event_handler(Some(move |e: global_hotkey::GlobalHotKeyEvent| {
                         if e.state == global_hotkey::HotKeyState::Pressed {
-                            let _ = proxy.send_event(UserEvent::Command("toggle".into()));
+                            let name = targets.lock().get(&e.id).cloned().unwrap_or_default();
+                            let _ = proxy.send_event(UserEvent::Command(format!("toggle:{name}")));
                         }
                     }));
                     self.hotkey = Some(m);
@@ -2535,13 +2688,25 @@ impl App {
         }
         // Keys already handled by a GNOME shortcut must not be grabbed twice.
         let gnome: Vec<String> = crate::gnome_dtem_accels();
-        for k in self.cfg.dropdown.hotkey.list() {
+        // The default dropdown also grabs the keys of the other dropdowns and forwards them.
+        let mut wanted: Vec<(String, String)> = self.dd().hotkey.list().into_iter().map(|k| (k, self.profile.clone())).collect();
+        if self.profile.is_empty() {
+            for (name, d) in &self.cfg.dropdowns {
+                wanted.extend(d.hotkey.list().into_iter().map(|k| (k, name.clone())));
+            }
+        }
+        let mut targets = self.hotkey_targets.lock();
+        targets.clear();
+        for (k, prof) in wanted {
             if gnome.iter().any(|g| g.eq_ignore_ascii_case(&crate::gnome_accel(&k))) {
                 continue;
             }
             match crate::hotkey_from_config(&k) {
                 Some(h) => match m.register(h) {
-                    Ok(_) => self.installed_hotkeys.push(k),
+                    Ok(_) => {
+                        targets.insert(h.id(), prof);
+                        self.installed_hotkeys.push(k);
+                    }
                     Err(e) => log::warn!("cannot grab hotkey {k}: {e}"),
                 },
                 None => log::error!("invalid dropdown hotkey {k:?}"),
@@ -2562,7 +2727,7 @@ impl App {
         };
         let old = std::mem::replace(&mut self.cfg, new);
         self.bindings = Bindings::new(&self.cfg);
-        self.theme = Theme::from_config(&self.cfg);
+        self.theme = profile_theme(&self.cfg, self.role, &self.profile);
         self.keycfg = keys::KeyCfg::from_config(&self.cfg);
         self.url_re = build_url_regex(&self.cfg);
         if old.transparency != self.cfg.transparency {
@@ -2591,7 +2756,7 @@ impl App {
             self.relayout(wid);
             if self.windows[&wid].dropdown && self.windows[&wid].visible && self.anim.is_none() {
                 self.apply_dropdown_geometry(el, wid);
-                let d = self.cfg.dropdown.clone();
+                let d = self.dd();
                 let w = &self.windows[&wid];
                 w.window.set_window_level(if d.always_on_top { WindowLevel::AlwaysOnTop } else { WindowLevel::Normal });
                 if let (Some(x), Some(id)) = (&self.x11, crate::x11::window_id(&w.window)) {
@@ -2599,7 +2764,12 @@ impl App {
                 }
             }
         }
-        if self.role == Role::Dropdown && old.dropdown.hotkey != self.cfg.dropdown.hotkey {
+        let keys_of = |c: &Config| {
+            let mut v = vec![c.dropdown.hotkey.list()];
+            v.extend(c.dropdowns.values().map(|d| d.hotkey.list()));
+            v
+        };
+        if self.role == Role::Dropdown && keys_of(&old) != keys_of(&self.cfg) {
             if !crate::gnome_dtem_accels().is_empty() {
                 if let Err(e) = crate::install_gnome_shortcut(&self.cfg, true) {
                     log::warn!("GNOME shortcut update failed: {e}");
@@ -2684,6 +2854,19 @@ fn pretty_combo(c: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("+")
+}
+
+/// Theme of this instance (a dropdown profile may override the color scheme).
+fn profile_theme(cfg: &Config, role: Role, profile: &str) -> Theme {
+    if role == Role::Dropdown {
+        if let Some(cs) = cfg.dropdown_profile(profile).color_scheme.filter(|c| !c.is_empty()) {
+            let mut c = cfg.clone();
+            c.color_scheme = cs;
+            c.colors = Default::default();
+            return Theme::from_config(&c);
+        }
+    }
+    Theme::from_config(cfg)
 }
 
 struct Anim {
@@ -2851,6 +3034,8 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Toast(pane, msg) => self.toast_pane(pane, msg),
             UserEvent::RemoteFile(pane, name, data) => self.on_remote_file(pane, name, data),
             UserEvent::ConfigChanged => self.apply_config(el),
+            UserEvent::Stream(id, ev) => self.on_stream(el, id, ev),
+            UserEvent::FocusPane(id) => self.focus_pane_global(el, id),
             UserEvent::Redraw(w) => {
                 if let Some(w) = self.windows.get(&w) {
                     w.window.request_redraw();
@@ -2865,6 +3050,21 @@ impl ApplicationHandler<UserEvent> for App {
                 let c = c.trim();
                 match c {
                     "toggle" => self.toggle_dropdown(el),
+                    t if t.starts_with("toggle:") => {
+                        let name = &t["toggle:".len()..];
+                        if name == self.profile {
+                            self.toggle_dropdown(el);
+                        } else {
+                            // another dropdown: forward to its process, or start it
+                            let sock = if name.is_empty() { "dropdown".to_string() } else { format!("dropdown-{name}") };
+                            if !crate::send_command(&sock, "toggle") {
+                                if let Ok(exe) = std::env::current_exe() {
+                                    let arg = if name.is_empty() { "--toggle".to_string() } else { format!("--toggle={name}") };
+                                    let _ = std::process::Command::new(exe).arg(arg).spawn();
+                                }
+                            }
+                        }
+                    }
                     "show" => {
                         if let Some(w) = self.dropdown_id() {
                             self.show_dropdown(el, w);
@@ -2956,21 +3156,21 @@ impl ApplicationHandler<UserEvent> for App {
                 if dropdown {
                     if f {
                         self.pending_hide = None;
-                    } else if self.cfg.dropdown.hide_on_focus_loss && self.windows[&wid].visible {
+                    } else if self.dd().hide_on_focus_loss && self.windows[&wid].visible {
                         self.pending_hide =
-                            Some((wid, Instant::now() + Duration::from_millis(self.cfg.dropdown.auto_hide_delay_ms)));
+                            Some((wid, Instant::now() + Duration::from_millis(self.dd().auto_hide_delay_ms)));
                     }
                 }
             }
             WindowEvent::CursorLeft { .. } => {
                 let w = &self.windows[&wid];
-                if w.dropdown && w.visible && self.cfg.dropdown.hide_on_mouse_leave {
+                if w.dropdown && w.visible && self.dd().hide_on_mouse_leave {
                     self.pending_hide =
-                        Some((wid, Instant::now() + Duration::from_millis(self.cfg.dropdown.auto_hide_delay_ms)));
+                        Some((wid, Instant::now() + Duration::from_millis(self.dd().auto_hide_delay_ms)));
                 }
             }
             WindowEvent::CursorEntered { .. } => {
-                if self.pending_hide.map(|(w, _)| w == wid).unwrap_or(false) && !self.cfg.dropdown.hide_on_focus_loss {
+                if self.pending_hide.map(|(w, _)| w == wid).unwrap_or(false) && !self.dd().hide_on_focus_loss {
                     self.pending_hide = None;
                 }
             }
@@ -3030,7 +3230,7 @@ impl ApplicationHandler<UserEvent> for App {
         if let Some((w, at)) = self.pending_hide {
             if Instant::now() >= at {
                 self.pending_hide = None;
-                let still_unfocused = self.windows.get(&w).map(|x| !x.focused || self.cfg.dropdown.hide_on_mouse_leave).unwrap_or(false);
+                let still_unfocused = self.windows.get(&w).map(|x| !x.focused || self.dd().hide_on_mouse_leave).unwrap_or(false);
                 if still_unfocused {
                     self.hide_dropdown(w);
                 }
@@ -3119,7 +3319,7 @@ impl App {
         let ts = TabState {
             title: None,
             active: 0,
-            layout: SNode::Leaf { cwd: None, command: None, scrollback: None, title: None, remote: Some(args) },
+            layout: SNode::Leaf { cwd: None, command: None, scrollback: None, title: None, remote: Some(args), remote_cwd: None },
         };
         self.add_tab_from_state(wid, &ts, false, at);
         let w = &self.windows[&wid];
@@ -3303,7 +3503,7 @@ impl App {
         let grid = term.grid();
         let row = &grid[point.line];
         let cols = grid.columns();
-        if let Some(h) = row[point.column].hyperlink() {
+        if let Some(h) = row[point.column].hyperlink().filter(|h| !h.uri().starts_with("dtem:")) {
             let uri = h.uri().to_string();
             let same = |c: usize| row[Column(c)].hyperlink().map(|x| x.uri() == uri).unwrap_or(false);
             let mut a = point.column.0;

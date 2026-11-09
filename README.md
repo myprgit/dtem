@@ -27,6 +27,47 @@ dtem --import-tilda              # reads ~/.config/tilda/config_0 (or pass a fil
 
 The importer converts every tilda option: hotkey, size/position/centering, monitor, slide animation, auto-hide, the unfocused-hotkey behaviour, always-on-top, sticky, taskbar, transparency, colors and palette, cursor, bold-is-bright, bell, scrollback, word chars, backspace/delete codes, command/login shell/working dir, title options, tab bar options, link matching, confirmations, and all key bindings. Your previous config is backed up first. A few options have no counterpart in dtem (tooltips, notebook border, set-as-desktop); the importer lists them.
 
+## Notifications and tab markers
+
+- Tabs you aren't looking at get a marker: **●** new output, **🔔** bell, **✗** a command failed.
+- Desktop notifications (click one to jump to the tab) are sent when:
+  - a command that ran ≥ 10 s finishes while you aren't looking (`notify_command_seconds`),
+  - a bell rings in a background tab — e.g. an agent waiting for input (`notify_on_bell`),
+  - a program sends OSC 9 / OSC 777 (`notify_programs`).
+- When a shell exits by itself (`exit`, Ctrl+D), dtem asks: Enter closes the pane, `r` restarts the shell and Esc keeps the pane open (`confirm_close.on_exit`).
+
+## Shell integration
+
+bash, zsh and fish are started with a small integration script. Your own `.bashrc`/`.zshrc` are loaded as usual; dtem only adds prompt marks (OSC 133) and cwd reports (OSC 7). It's turned off with `shell_integration = false`. With it:
+
+| | |
+|---|---|
+| `kitty_mod+z` / `kitty_mod+x` | jump to the previous / next prompt |
+| `kitty_mod+g` | copy the last command's output |
+| long-running command notifications | see above |
+| ssh tabs | the remote directory is remembered; after a restart, reconnecting opens there |
+
+On hosts opened with `dtem --remote`, the integration, `dtem-copy` and `dtem-icat` are installed into `~/.local` automatically.
+
+## Keyboard hints
+
+`kitty_mod+e` puts letters on every link, path, IP address, git hash and e-mail address on the screen. Press a letter to open the link (or copy anything else). Press Shift+letter to type the item into the terminal instead.
+
+## Images
+
+dtem implements the kitty graphics protocol, so images work with `dtem --icat file.png`, with `dtem-icat` on remote hosts, and with tools that support the protocol (yazi, chafa, timg, …). Images scroll with the text and stay in the scrollback.
+
+## Second dropdown
+
+```toml
+[dropdowns.2]
+hotkey = "shift+F1"
+height = 0.6
+color_scheme = "dracula"
+```
+
+Each dropdown has its own tabs, session, monitor memory and settings; they appear on the settings page as **Dropdown** and **Dropdown 2**. `dtem --toggle=2` toggles it, and `dtem --install-gnome-shortcut` registers the hotkeys of all dropdowns. To stop GNOME's open/close animation on a dropdown, keep `desktop_animation = false` (the default).
+
 ## Right-click menu
 
 Right-click on a terminal (or the tab bar) opens a menu like tilda's: New Tab, Close Tab, Copy, Paste, Open/Copy Link (when clicking a link), splits, Toggle Fullscreen / Transparency / Searchbar, Preferences…, Keyboard Shortcuts…, and Quit. Each item shows its current shortcut. If a program uses the mouse (vim, htop), use **Shift+right-click**.

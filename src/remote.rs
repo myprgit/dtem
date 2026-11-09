@@ -14,6 +14,8 @@ pub struct Remote {
     pub args: Vec<String>,
     /// Uses our ControlMaster socket (created by `dtem --remote`)
     pub multiplexed: bool,
+    /// Remote directory to start in (remembered via shell integration)
+    pub cwd: Option<String>,
 }
 
 pub fn control_path() -> String {
@@ -66,7 +68,7 @@ pub fn split_ssh_args(args: &[String]) -> Option<(Vec<String>, Vec<String>)> {
 
 impl Remote {
     pub fn new_multiplexed(args: Vec<String>) -> Remote {
-        Remote { args, multiplexed: true }
+        Remote { args, multiplexed: true, cwd: None }
     }
 
     /// The destination as shown to the user (user@host).
@@ -84,7 +86,15 @@ impl Remote {
             "-o".into(),
             "ControlPersist=60".into(),
         ];
+        v.push("-t".into());
         v.extend(self.args.iter().cloned());
+        // Start the login shell through dtem-shell (shell integration + start directory)
+        // when it's installed; plain login shell otherwise.
+        let cwd = self.cwd.as_deref().map(shell_quote).unwrap_or_default();
+        let inner = format!(
+            "if [ -x \"$HOME/.local/bin/dtem-shell\" ]; then exec \"$HOME/.local/bin/dtem-shell\" {cwd}; else exec \"${{SHELL:-/bin/sh}}\" -l; fi"
+        );
+        v.push(format!("exec sh -c {}", shell_quote(&inner)));
         v
     }
 
@@ -174,10 +184,10 @@ done"#,
             .unwrap_or(false)
     }
 
-    /// Install `dtem-copy` on the remote (in ~/.local/bin).
+    /// Install dtem-copy, dtem-icat and the shell integration on the remote.
     pub fn install_helpers(&self) -> anyhow::Result<()> {
-        let script = "mkdir -p \"$HOME/.local/bin\" && cat > \"$HOME/.local/bin/dtem-copy\" && chmod +x \"$HOME/.local/bin/dtem-copy\"";
-        self.run(script, Some(HELPER.as_bytes()))?;
+        let script = crate::shellint::remote_installer(HELPER);
+        self.run("sh -s", Some(script.as_bytes()))?;
         Ok(())
     }
 }
@@ -236,7 +246,7 @@ pub fn detect_foreground_ssh(pty_fd: i32) -> Option<Remote> {
     } else {
         opts
     };
-    Some(Remote { args, multiplexed })
+    Some(Remote { args, multiplexed, cwd: None })
 }
 
 #[cfg(test)]

@@ -1,0 +1,25 @@
+#!/bin/sh
+# dtem-icat — show images in the terminal (kitty graphics protocol).
+#   dtem-icat photo.png [more.jpg ...]
+for f in "$@"; do
+  [ -r "$f" ] || { echo "dtem-icat: $f: cannot read" >&2; continue; }
+  src="$f"; tmp=""
+  magic=$(head -c 8 "$f" | od -An -tx1 | tr -d ' \n')
+  if [ "$magic" != "89504e470d0a1a0a" ]; then
+    if command -v convert >/dev/null 2>&1; then
+      tmp=$(mktemp /tmp/dtem-icat.XXXXXX.png) && convert "$f[0]" "$tmp" 2>/dev/null && src="$tmp" || { echo "dtem-icat: cannot convert $f" >&2; continue; }
+    else
+      echo "dtem-icat: $f: only PNG is supported without ImageMagick" >&2; continue
+    fi
+  fi
+  chunks=$(mktemp /tmp/dtem-icat.XXXXXX)
+  { base64 < "$src" | tr -d '\n' | fold -w 4096; echo; } > "$chunks"
+  n=$(wc -l < "$chunks"); i=0
+  while IFS= read -r chunk; do
+    i=$((i + 1)); m=1; [ "$i" -ge "$n" ] && m=0
+    if [ "$i" -eq 1 ]; then printf '\033_Ga=T,f=100,q=2,m=%s;%s\033\\' "$m" "$chunk"
+    else printf '\033_Gm=%s;%s\033\\' "$m" "$chunk"; fi
+  done < "$chunks"
+  printf '\n'
+  rm -f "$chunks" ${tmp:+"$tmp"}
+done

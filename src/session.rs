@@ -19,6 +19,9 @@ pub enum SNode {
         /// ssh arguments for remote panes (`dtem --remote ...`)
         #[serde(default, skip_serializing_if = "Option::is_none")]
         remote: Option<Vec<String>>,
+        /// directory on the remote host (reported by shell integration)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remote_cwd: Option<String>,
     },
     Split {
         vertical: bool,
@@ -139,12 +142,13 @@ pub fn gc_scrollback(role: &str, keep: &[String]) {
 pub fn to_layout_file(s: &Session) -> Session {
     fn strip(n: &SNode) -> SNode {
         match n {
-            SNode::Leaf { cwd, title, command, remote, .. } => SNode::Leaf {
+            SNode::Leaf { cwd, title, command, remote, remote_cwd, .. } => SNode::Leaf {
                 cwd: cwd.clone(),
                 command: command.clone(),
                 scrollback: None,
                 title: title.clone(),
                 remote: remote.clone(),
+                remote_cwd: remote_cwd.clone(),
             },
             SNode::Split { vertical, ratio, a, b } => SNode::Split {
                 vertical: *vertical,

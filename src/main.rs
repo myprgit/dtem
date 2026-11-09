@@ -2,6 +2,7 @@ mod app;
 mod confedit;
 mod config;
 mod font;
+mod images;
 mod keys;
 mod layout;
 mod pane;
@@ -10,6 +11,8 @@ mod renderer;
 mod schemes;
 mod session;
 mod settings;
+mod shellint;
+mod stream;
 mod tilda;
 mod x11;
 
@@ -30,6 +33,10 @@ pub enum UserEvent {
     Redraw(winit::window::WindowId),
     /// dtem.toml changed on disk
     ConfigChanged,
+    /// Escape sequences picked out of a pane's output
+    Stream(u64, stream::StreamEvent),
+    /// A desktop notification was clicked: focus this pane
+    FocusPane(u64),
 }
 
 const HELP: &str = "dtem — GPU accelerated terminal
@@ -46,6 +53,7 @@ USAGE:
   dtem --install-gnome-shortcut register the dropdown hotkey in GNOME (X11 + Wayland)
   dtem --quit [--dropdown] [--no-save]
                                 quit the running instance (--no-save: forget the session)
+  dtem --icat FILE...           show images in the terminal (kitty graphics protocol)
   dtem --settings[=keys]        settings page / shortcut editor (also ctrl+, or right click)
   dtem --import-tilda [FILE]    import a tilda config (default ~/.config/tilda/config_0)
 
@@ -65,6 +73,8 @@ struct Args {
     import_tilda: Option<Option<PathBuf>>,
     remote: Option<Vec<String>>,
     new_tab: bool,
+    /// dropdown profile ("" = default)
+    profile: String,
     install_helpers: Option<Vec<String>>,
 }
 
@@ -82,6 +92,7 @@ fn parse_args() -> Args {
         import_tilda: None,
         remote: None,
         new_tab: false,
+        profile: String::new(),
         install_helpers: None,
     };
     let mut it = std::env::args().skip(1);
@@ -89,6 +100,14 @@ fn parse_args() -> Args {
         match arg.as_str() {
             "--dropdown" | "-d" => a.dropdown = true,
             "--toggle" => a.toggle = true,
+            s if s.starts_with("--dropdown=") => {
+                a.dropdown = true;
+                a.profile = s["--dropdown=".len()..].to_string();
+            }
+            s if s.starts_with("--toggle=") => {
+                a.toggle = true;
+                a.profile = s["--toggle=".len()..].to_string();
+            }
             "--hidden" => a.hidden = true,
             "--no-restore" => a.no_restore = true,
             "--session" => {
@@ -111,6 +130,10 @@ fn parse_args() -> Args {
                 a.install_helpers = Some(it.by_ref().collect());
             }
             "--new-tab" => a.new_tab = true,
+            "--icat" => {
+                let files: Vec<String> = it.by_ref().collect();
+                std::process::exit(icat(&files));
+            }
             "--remote" | "-r" => {
                 let mut rest: Vec<String> = it.by_ref().collect();
                 if rest.first().map(|s| s == "--new-tab").unwrap_or(false) {
@@ -145,7 +168,7 @@ fn socket_path(role: &str) -> PathBuf {
     dir.join(format!("dtem-{role}.sock"))
 }
 
-fn send_command(role: &str, cmd: &str) -> bool {
+pub fn send_command(role: &str, cmd: &str) -> bool {
     match UnixStream::connect(socket_path(role)) {
         Ok(mut s) => s.write_all(format!("{cmd}\n").as_bytes()).is_ok(),
         Err(_) => false,
@@ -248,13 +271,27 @@ fn accel_norm(a: &str) -> String {
 /// Other custom shortcuts using the same key are disabled (reported).
 pub fn install_gnome_shortcut(cfg: &config::Config, quiet: bool) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
-    let cmd = format!("{} --toggle", exe.display());
-    let keys = cfg.dropdown.hotkey.list();
     let mut paths = custom_paths();
     // drop our previous entries
     paths.retain(|p| !p.contains("/dtem-dropdown"));
     let mut ours = Vec::new();
-    for (n, key) in keys.iter().enumerate() {
+    let mut entries: Vec<(String, String, String)> = Vec::new(); // (path, command, key)
+    let mut profiles: Vec<String> = vec![String::new()];
+    profiles.extend(cfg.dropdowns.keys().cloned());
+    for prof in &profiles {
+        let d = cfg.dropdown_profile(prof);
+        let slug: String = prof.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+        let cmd = if prof.is_empty() { format!("{} --toggle", exe.display()) } else { format!("{} --toggle={prof}", exe.display()) };
+        for (n, key) in d.hotkey.list().iter().enumerate() {
+            let path = match (prof.is_empty(), n) {
+                (true, 0) => format!("{CUSTOM_PREFIX}dtem-dropdown/"),
+                (true, n) => format!("{CUSTOM_PREFIX}dtem-dropdown-{}/", n + 1),
+                (false, n) => format!("{CUSTOM_PREFIX}dtem-dropdown-p-{slug}-{}/", n + 1),
+            };
+            entries.push((path, cmd.clone(), key.clone()));
+        }
+    }
+    for (path, cmd, key) in &entries {
         let accel = gnome_accel(key);
         // disable conflicting shortcuts (e.g. tilda on Ctrl+Alt+T)
         for p in &paths {
@@ -266,12 +303,11 @@ pub fn install_gnome_shortcut(cfg: &config::Config, quiet: bool) -> anyhow::Resu
                 }
             }
         }
-        let path = if n == 0 { format!("{CUSTOM_PREFIX}dtem-dropdown/") } else { format!("{CUSTOM_PREFIX}dtem-dropdown-{}/", n + 1) };
         let schema = format!("{MEDIA_KEYS}.custom-keybinding:{path}");
         for (k, v) in [("name", "dtem dropdown"), ("command", cmd.as_str()), ("binding", accel.as_str())] {
             anyhow::ensure!(gsettings(&["set", &schema, k, v]).is_some(), "gsettings set {k} failed");
         }
-        ours.push(path);
+        ours.push(path.clone());
         if !quiet {
             println!("GNOME shortcut: {accel} → {cmd}");
         }
@@ -280,6 +316,54 @@ pub fn install_gnome_shortcut(cfg: &config::Config, quiet: bool) -> anyhow::Resu
     let list = format!("[{}]", paths.iter().map(|p| format!("'{p}'")).collect::<Vec<_>>().join(", "));
     anyhow::ensure!(gsettings(&["set", MEDIA_KEYS, "custom-keybindings", &list]).is_some(), "gsettings failed");
     Ok(())
+}
+
+/// Print images with the kitty graphics protocol (PNG payload, 4 KiB chunks).
+fn icat(files: &[String]) -> i32 {
+    use base64::Engine;
+    use std::io::Write;
+    let mut rc = 0;
+    let mut out = std::io::stdout().lock();
+    for f in files {
+        let data = match std::fs::read(f) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("dtem --icat: {f}: {e}");
+                rc = 1;
+                continue;
+            }
+        };
+        let png = if data.starts_with(b"\x89PNG") {
+            data
+        } else {
+            match image::load_from_memory(&data) {
+                Ok(img) => {
+                    let mut c = std::io::Cursor::new(Vec::new());
+                    if img.write_to(&mut c, image::ImageFormat::Png).is_err() {
+                        rc = 1;
+                        continue;
+                    }
+                    c.into_inner()
+                }
+                Err(e) => {
+                    eprintln!("dtem --icat: {f}: {e}");
+                    rc = 1;
+                    continue;
+                }
+            }
+        };
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+        let chunks: Vec<&[u8]> = b64.as_bytes().chunks(4096).collect();
+        for (i, c) in chunks.iter().enumerate() {
+            let m = if i + 1 < chunks.len() { 1 } else { 0 };
+            let head = if i == 0 { format!("a=T,f=100,q=2,m={m}") } else { format!("m={m}") };
+            let _ = write!(out, "\x1b_G{head};");
+            let _ = out.write_all(c);
+            let _ = write!(out, "\x1b\\");
+        }
+        let _ = writeln!(out);
+    }
+    rc
 }
 
 fn watch_config(proxy: winit::event_loop::EventLoopProxy<UserEvent>) {
@@ -382,7 +466,12 @@ fn main() {
     }
 
     let role = if args.dropdown || args.toggle { app::Role::Dropdown } else { app::Role::Main };
-    let rname = role.name();
+    let rname_owned = match (role, args.profile.as_str()) {
+        (app::Role::Main, _) => "main".to_string(),
+        (app::Role::Dropdown, "") => "dropdown".to_string(),
+        (app::Role::Dropdown, p) => format!("dropdown-{p}"),
+    };
+    let rname = rname_owned.as_str();
 
     // Already running? Forward the request and exit.
     let cmd = if args.quit {
@@ -466,10 +555,10 @@ fn main() {
         restore: !args.no_restore,
         session_file: args.session.clone(),
         // `dtem --toggle` always shows; `dtem --dropdown` honours dropdown.start_hidden
-        show_dropdown: !args.hidden && (args.toggle || !cfg.dropdown.start_hidden),
+        show_dropdown: !args.hidden && (args.toggle || !cfg.dropdown_profile(&args.profile).start_hidden),
         remote: args.remote.clone(),
     };
-    let mut app = match app::App::new(cfg, role, proxy, startup) {
+    let mut app = match app::App::new(cfg, role, args.profile.clone(), proxy, startup) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("dtem: {e}");
