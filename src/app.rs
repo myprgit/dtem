@@ -901,6 +901,11 @@ impl App {
         if d.always_on_top {
             win.window.set_window_level(WindowLevel::AlwaysOnTop);
         }
+        if fullscreen && !d.desktop_animation {
+            if let (Some(x), Some(id)) = (&self.x11, crate::x11::window_id(&win.window)) {
+                x.set_normal_type(id, true);
+            }
+        }
         if fullscreen {
             win.window.set_fullscreen(Some(Fullscreen::Borderless(mon.clone())));
         }
@@ -922,6 +927,26 @@ impl App {
         }
     }
 
+    /// Enter/leave fullscreen. Dropdowns without desktop animation are "utility" windows,
+    /// which mutter refuses to make fullscreen — switch them to a normal window meanwhile.
+    fn set_fullscreen(&mut self, wid: WindowId, on: bool) {
+        let utility = self.windows.get(&wid).map(|w| w.dropdown).unwrap_or(false) && !self.dd().desktop_animation;
+        let Some(w) = self.windows.get(&wid) else { return };
+        let xid = crate::x11::window_id(&w.window);
+        if on {
+            if let (true, Some(x), Some(id)) = (utility, &self.x11, xid) {
+                x.set_normal_type(id, true);
+            }
+            let mon = w.window.current_monitor();
+            w.window.set_fullscreen(Some(Fullscreen::Borderless(mon)));
+        } else {
+            w.window.set_fullscreen(None);
+            if let (true, Some(x), Some(id)) = (utility, &self.x11, xid) {
+                x.set_normal_type(id, false);
+            }
+        }
+    }
+
     fn hide_dropdown(&mut self, wid: WindowId) {
         self.pending_hide = None;
         let d = self.dd();
@@ -930,7 +955,8 @@ impl App {
             win.was_fullscreen = win.window.fullscreen().is_some();
             if win.was_fullscreen {
                 // leave fullscreen before unmapping so the WM restores it cleanly next time
-                win.window.set_fullscreen(None);
+                self.set_fullscreen(wid, false);
+                let win = self.windows.get_mut(&wid).unwrap();
                 win.window.set_visible(false);
                 win.visible = false;
                 return;
@@ -1415,7 +1441,11 @@ impl App {
             }
             Action::ToggleFullscreen => {
                 let w = &self.windows[&wid].window;
-                w.set_fullscreen(if w.fullscreen().is_some() { None } else { Some(Fullscreen::Borderless(None)) });
+                let on = w.fullscreen().is_none();
+                self.set_fullscreen(wid, on);
+                if !on && self.windows[&wid].dropdown {
+                    self.apply_dropdown_geometry(el, wid);
+                }
             }
             Action::SaveSessionFile => self.export_session_file(),
             Action::ReloadConfig => {

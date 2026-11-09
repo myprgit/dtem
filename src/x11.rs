@@ -14,6 +14,9 @@ x11rb::atom_manager! {
         _NET_WM_STATE_STICKY,
         _NET_WM_STATE_ABOVE,
         _NET_WM_DESKTOP,
+        _NET_WM_WINDOW_TYPE,
+        _NET_WM_WINDOW_TYPE_NORMAL,
+        _NET_WM_WINDOW_TYPE_UTILITY,
     }
 }
 
@@ -71,6 +74,15 @@ impl X11 {
         if sticky {
             self.client_message(win, a._NET_WM_DESKTOP, [0xFFFF_FFFF, 2, 0, 0, 0]);
         }
+    }
+
+    /// Window type: utility (no GNOME open/close animation) or normal.
+    /// mutter only lets *normal* windows go fullscreen, so fullscreen switches to normal.
+    pub fn set_normal_type(&self, win: u32, normal: bool) {
+        let a = &self.atoms;
+        let t = if normal { a._NET_WM_WINDOW_TYPE_NORMAL } else { a._NET_WM_WINDOW_TYPE_UTILITY };
+        let _ = self.conn.change_property32(PropMode::REPLACE, win, a._NET_WM_WINDOW_TYPE, AtomEnum::ATOM, &[t]);
+        let _ = self.conn.flush();
     }
 
     /// Initial states for a not-yet-mapped window (read by the WM at map time).
