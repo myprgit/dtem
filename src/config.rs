@@ -182,8 +182,6 @@ pub struct Dropdown {
     pub start_fullscreen: bool,
     /// When the last tab exits: "new_tab_hide" | "new_tab" | "quit"
     pub on_last_tab_exit: String,
-    /// Let the desktop (GNOME) animate the window when it opens/closes (X11; restart needed)
-    pub desktop_animation: bool,
     /// Per-dropdown overrides
     pub color_scheme: Option<String>,
     pub font_size: Option<f32>,
@@ -214,7 +212,6 @@ impl Default for Dropdown {
             start_hidden: false,
             start_fullscreen: false,
             on_last_tab_exit: "new_tab_hide".into(),
-            desktop_animation: false,
             color_scheme: None,
             font_size: None,
         }

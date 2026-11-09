@@ -66,7 +66,9 @@ height = 0.6
 color_scheme = "dracula"
 ```
 
-Each dropdown has its own tabs, session, monitor memory and settings; they appear on the settings page as **Dropdown** and **Dropdown 2**. `dtem --toggle=2` toggles it, and `dtem --install-gnome-shortcut` registers the hotkeys of all dropdowns. To stop GNOME's open/close animation on a dropdown, keep `desktop_animation = false` (the default).
+Each dropdown has its own tabs, session, monitor memory and settings; they appear on the settings page as **Dropdown** and **Dropdown 2**. `dtem --toggle=2` toggles it, and `dtem --install-gnome-shortcut` registers the hotkeys of all dropdowns.
+
+Dropdowns are utility windows, so GNOME doesn't animate them. F11 makes them cover their monitor; they don't use the WM's fullscreen mode.
 
 ## Right-click menu
 

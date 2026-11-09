@@ -104,7 +104,6 @@ all_workspaces = true
 start_hidden = false
 start_fullscreen = false
 on_last_tab_exit = "new_tab_hide"  # new_tab_hide | new_tab | quit
-desktop_animation = false        # GNOME open/close animation (restart the dropdown)
 # color_scheme = "dracula"       # per-dropdown overrides
 # font_size = 12.0
 

@@ -154,10 +154,6 @@ pub struct App {
     hint_res: Vec<(HintKind, regex::Regex)>,
     /// global hotkey id → dropdown profile it toggles
     hotkey_targets: Arc<parking_lot::Mutex<HashMap<u32, String>>>,
-    /// verify a covering-fullscreen after the WM had a chance to constrain it
-    fs_check: Option<(WindowId, Instant)>,
-    /// the WM didn't let a utility window cover the monitor: go straight to real fullscreen
-    pseudo_fs_failed: bool,
     /// touchpad ctrl+scroll accumulator (pixels)
     zoom_acc: f64,
     last_wheel: Option<(Instant, bool)>,
@@ -206,8 +202,7 @@ impl App {
             profile: profile.clone(),
             hint_res: hint_regexes(),
             hotkey_targets: Default::default(),
-            fs_check: None,
-            pseudo_fs_failed: false,
+
             zoom_acc: 0.0,
             last_wheel: None,
             cfg,
@@ -313,8 +308,8 @@ impl App {
                 monitor_name = m.name();
             }
             attrs = attrs.with_decorations(false).with_visible(false);
-            if !self.dd().desktop_animation {
-                // GNOME Shell only animates normal/dialog windows when they map/unmap
+            // Always a utility window: GNOME Shell doesn't animate those when they map/unmap
+            {
                 use winit::platform::x11::{WindowAttributesExtX11, WindowType};
                 attrs = attrs.with_x11_window_type(vec![WindowType::Utility]);
             }
@@ -931,76 +926,28 @@ impl App {
         }
     }
 
-    /// Enter/leave fullscreen.
-    /// Dropdowns without desktop animation are "utility" windows, which mutter won't make
-    /// fullscreen: they cover their monitor instead and stay utility windows. If the WM
-    /// keeps them from covering it (checked shortly after), we fall back to real fullscreen.
+    /// Enter/leave fullscreen. Dropdowns stay utility windows (mutter won't make those
+    /// fullscreen), so they cover their monitor instead; normal windows use real fullscreen.
     fn set_fullscreen(&mut self, wid: WindowId, on: bool) {
-        let utility = self.windows.get(&wid).map(|w| w.dropdown).unwrap_or(false) && !self.dd().desktop_animation;
-        let try_cover = utility && !self.pseudo_fs_failed;
         let Some(w) = self.windows.get_mut(&wid) else { return };
-        if on {
-            if try_cover {
+        if w.dropdown {
+            if on {
                 if let Some(m) = w.window.current_monitor().filter(|m| m.size().width >= 100 && m.size().height >= 100) {
                     w.pseudo_fs = true;
                     w.window.set_outer_position(m.position());
                     let _ = w.window.request_inner_size(m.size());
-                    self.fs_check = Some((wid, Instant::now() + Duration::from_millis(350)));
-                    return;
                 }
+            } else {
+                w.pseudo_fs = false; // caller restores the dropdown geometry
             }
-            // real fullscreen: mutter needs a normal window for that
-            if utility {
-                if let (Some(x), Some(id)) = (&self.x11, crate::x11::window_id(&w.window)) {
-                    x.set_normal_type(id, true);
-                }
-            }
+            return;
+        }
+        if on {
             let mon = w.window.current_monitor();
             w.window.set_fullscreen(Some(Fullscreen::Borderless(mon)));
         } else {
-            if w.pseudo_fs {
-                w.pseudo_fs = false;
-                self.fs_check = None;
-                return; // caller restores the dropdown geometry
-            }
             w.window.set_fullscreen(None);
-            if utility {
-                if let (Some(x), Some(id)) = (&self.x11, crate::x11::window_id(&w.window)) {
-                    x.set_normal_type(id, false);
-                }
-            }
         }
-    }
-
-    /// Did the covering-fullscreen work? If not, use real fullscreen (normal window type).
-    fn check_pseudo_fullscreen(&mut self) {
-        let Some((wid, at)) = self.fs_check else { return };
-        if Instant::now() < at {
-            return;
-        }
-        self.fs_check = None;
-        let Some(w) = self.windows.get_mut(&wid) else { return };
-        if !w.pseudo_fs || !w.visible {
-            return;
-        }
-        let Some(m) = w.window.current_monitor() else { return };
-        let (mp, ms) = (m.position(), m.size());
-        let pos = w.window.outer_position().unwrap_or_default();
-        let size = w.window.outer_size();
-        let covers = (pos.x - mp.x).abs() <= 1
-            && (pos.y - mp.y).abs() <= 1
-            && size.width + 2 >= ms.width
-            && size.height + 2 >= ms.height;
-        if covers {
-            return;
-        }
-        log::info!("WM constrained the covering window; using real fullscreen");
-        w.pseudo_fs = false;
-        self.pseudo_fs_failed = true;
-        if let (Some(x), Some(id)) = (&self.x11, crate::x11::window_id(&w.window)) {
-            x.set_normal_type(id, true);
-        }
-        w.window.set_fullscreen(Some(Fullscreen::Borderless(Some(m))));
     }
 
     fn hide_dropdown(&mut self, wid: WindowId) {
@@ -3313,10 +3260,7 @@ impl ApplicationHandler<UserEvent> for App {
         if let Some(t) = self.step_anim(el) {
             next = next.min(t);
         }
-        self.check_pseudo_fullscreen();
-        if let Some((_, at)) = self.fs_check {
-            next = next.min(at);
-        }
+
         if let Some((w, at)) = self.pending_hide {
             if Instant::now() >= at {
                 self.pending_hide = None;

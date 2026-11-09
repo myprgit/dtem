@@ -184,7 +184,6 @@ fn dropdown_items(p: &str) -> Vec<Item> {
         it(&f("monitor"), "Initial monitor", Text, "e.g. DP-1; afterwards the last used monitor is remembered"),
         it(&f("color_scheme"), "Color scheme", Text, "empty = global scheme (Tab completes)"),
         it(&f("font_size"), "Font size", Float(5.0, 48.0, 0.5), "empty = global font size"),
-        it(&f("desktop_animation"), "Desktop open/close animation", Bool, "GNOME's window animation (restart the dropdown)"),
         it(&f("animation"), "Slide animation", Bool, "dtem's own slide-in"),
         it(&f("animation_duration_ms"), "Slide time", Int(30, 2000, 10), "ms"),
         it(&f("animation_from"), "Slide from", Choice(&["top", "bottom", "left", "right"]), ""),
