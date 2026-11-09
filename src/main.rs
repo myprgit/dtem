@@ -40,7 +40,8 @@ USAGE:
   dtem --dropdown --hidden      start the dropdown hidden (for autostart)
   dtem --toggle                 show/hide the dropdown (starts it if needed)
   dtem --session FILE.json      open a layout/session file
-  dtem --remote [ssh args] HOST open an ssh session in a new tab (clipboard/file sync)
+  dtem --remote [ssh args] HOST ssh with clipboard/file sync (inside dtem: in the current pane)
+  dtem --remote --new-tab HOST  ssh in a new tab of the running dtem
   dtem --no-restore             don't restore the previous session
   dtem --install-gnome-shortcut register the dropdown hotkey in GNOME (X11 + Wayland)
   dtem --quit [--dropdown] [--no-save]
@@ -63,6 +64,8 @@ struct Args {
     settings: Option<Option<String>>,
     import_tilda: Option<Option<PathBuf>>,
     remote: Option<Vec<String>>,
+    new_tab: bool,
+    install_helpers: Option<Vec<String>>,
 }
 
 fn parse_args() -> Args {
@@ -78,6 +81,8 @@ fn parse_args() -> Args {
         settings: None,
         import_tilda: None,
         remote: None,
+        new_tab: false,
+        install_helpers: None,
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
@@ -102,8 +107,16 @@ fn parse_args() -> Args {
                 }
                 a.import_tilda = Some(next.map(PathBuf::from));
             }
+            "--install-remote-helpers" => {
+                a.install_helpers = Some(it.by_ref().collect());
+            }
+            "--new-tab" => a.new_tab = true,
             "--remote" | "-r" => {
-                let rest: Vec<String> = it.by_ref().collect();
+                let mut rest: Vec<String> = it.by_ref().collect();
+                if rest.first().map(|s| s == "--new-tab").unwrap_or(false) {
+                    rest.remove(0);
+                    a.new_tab = true;
+                }
                 if rest.is_empty() {
                     eprintln!("--remote needs an ssh destination, e.g. dtem --remote user@host");
                     std::process::exit(2);
@@ -288,7 +301,7 @@ fn watch_config(proxy: winit::event_loop::EventLoopProxy<UserEvent>) {
 }
 
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn,dtem=info")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let args = parse_args();
     let cfg = config::Config::load();
 
@@ -324,6 +337,48 @@ fn main() {
             }
         }
         return;
+    }
+
+    // Background helper installer started by an inline `dtem --remote`
+    if let Some(rargs) = args.install_helpers.clone() {
+        let r = remote::Remote::new_multiplexed(rargs);
+        for _ in 0..300 {
+            if r.is_connected() {
+                let _ = r.install_helpers();
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        return;
+    }
+    // `dtem --remote host` typed inside a dtem pane: run ssh right here (like `kitten ssh`).
+    // The multiplexed ssh is detected as the pane's foreground process, so image/file paste
+    // and dtem-copy work without a separate tab.
+    if let Some(rargs) = args.remote.clone() {
+        let inside_dtem = std::env::var("TERM_PROGRAM").map(|v| v == "dtem").unwrap_or(false);
+        if inside_dtem && !args.new_tab {
+            if remote::split_ssh_args(&rargs).is_none() {
+                eprintln!("--remote: no ssh destination given");
+                std::process::exit(2);
+            }
+            let r = remote::Remote::new_multiplexed(rargs.clone());
+            if cfg.remote_install_helpers {
+                if let Ok(exe) = std::env::current_exe() {
+                    use std::process::Stdio;
+                    let _ = std::process::Command::new(exe)
+                        .arg("--install-remote-helpers")
+                        .args(&rargs)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn();
+                }
+            }
+            use std::os::unix::process::CommandExt;
+            let err = std::process::Command::new("ssh").args(r.session_argv()).exec();
+            eprintln!("cannot run ssh: {err}");
+            std::process::exit(1);
+        }
     }
 
     let role = if args.dropdown || args.toggle { app::Role::Dropdown } else { app::Role::Main };

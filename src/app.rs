@@ -86,7 +86,7 @@ struct OsWin {
     toast: Option<(String, Instant)>,
     /// (pane, grid line, first col, last col, url) under the mouse while ctrl is held
     hover_url: Option<(u64, i32, usize, usize, String)>,
-    pointer_cursor: bool,
+    cursor_icon: winit::window::CursorIcon,
     ime_area: Option<(i32, i32)>,
     /// When the window last lost focus (the dropdown hotkey itself steals focus)
     unfocused_at: Option<Instant>,
@@ -376,7 +376,7 @@ impl App {
                 preedit: None,
                 toast: None,
                 hover_url: None,
-                pointer_cursor: false,
+                cursor_icon: winit::window::CursorIcon::Text,
                 ime_area: None,
                 unfocused_at: None,
                 search: None,
@@ -1811,6 +1811,9 @@ impl App {
 
     fn on_cursor_moved(&mut self, wid: WindowId, x: f64, y: f64) {
         self.windows.get_mut(&wid).unwrap().cursor = (x, y);
+        if self.windows[&wid].menu.is_some() {
+            self.update_hover(wid);
+        }
         if let Some(menu) = self.windows.get_mut(&wid).unwrap().menu.as_mut() {
             let h = menu.item_at(x as f32, y as f32);
             if h != menu.hover {
@@ -3312,13 +3315,26 @@ impl App {
                 hover = self.url_at(id, point).map(|(a, b, u)| (id, point.line.0, a, b, u));
             }
         }
+        // Mouse cursor: hand on links and tabs, arrow on menu/scrollbar/borders, I-beam on text
+        use winit::window::CursorIcon;
+        let w = &self.windows[&wid];
+        let icon = if w.menu.is_some() {
+            CursorIcon::Default
+        } else if hover.is_some() || w.tab_rects.iter().any(|(_, r)| r.contains(x as f32, y as f32)) {
+            CursorIcon::Pointer
+        } else if self.scrollbar_hit(wid, x, y).is_some() {
+            CursorIcon::Default
+        } else if self.pane_at(wid, x, y).is_some() {
+            CursorIcon::Text
+        } else {
+            CursorIcon::Default
+        };
         let win = self.windows.get_mut(&wid).unwrap();
         let changed = win.hover_url.as_ref().map(|h| (h.0, h.1, h.2)) != hover.as_ref().map(|h| (h.0, h.1, h.2));
-        let pointer = hover.is_some();
         win.hover_url = hover;
-        if pointer != win.pointer_cursor {
-            win.pointer_cursor = pointer;
-            win.window.set_cursor(if pointer { winit::window::CursorIcon::Pointer } else { winit::window::CursorIcon::Text });
+        if icon != win.cursor_icon {
+            win.cursor_icon = icon;
+            win.window.set_cursor(icon);
         }
         if changed {
             win.window.request_redraw();

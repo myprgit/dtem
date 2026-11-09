@@ -59,7 +59,7 @@ dtem --remote user@host
 dtem --remote -p 2222 -i ~/.ssh/key user@host     # any ssh options
 ```
 
-Opens an ssh session in a new tab. The session is multiplexed through an SSH ControlMaster, so file transfers reuse the same authenticated connection and never ask for a password again.
+Typed inside a dtem terminal, it runs ssh **right in that pane** (like `kitten ssh`); use `--new-tab` to open it in a new tab instead. Started from elsewhere, it opens a tab in the running dtem. The session is multiplexed through an SSH ControlMaster, so file transfers reuse the same authenticated connection and never ask for a password again.
 
 | What | How |
 |---|---|

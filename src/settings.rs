@@ -17,6 +17,8 @@ enum Kind {
     Bool,
     Int(i64, i64, i64),
     Float(f64, f64, f64),
+    /// Fraction stored, shown/edited as a percentage (min, max, step in fraction units)
+    Percent(f64, f64, f64),
     Text,
     Choice(&'static [&'static str]),
     Color,
@@ -94,10 +96,10 @@ fn sections() -> Vec<Section> {
             name: "Dropdown",
             items: vec![
                 it("dropdown.hotkey", "Hotkey(s)", Hotkeys, "comma separated, e.g. F1, ctrl+alt+t"),
-                it("dropdown.width", "Width", Float(0.1, 1.0, 0.05), "fraction of the monitor"),
-                it("dropdown.height", "Height", Float(0.1, 1.0, 0.05), "fraction of the monitor"),
                 it("dropdown.centered_horizontally", "Center horizontally", Bool, ""),
                 it("dropdown.centered_vertically", "Center vertically", Bool, ""),
+                it("dropdown.width", "Width", Percent(0.1, 1.0, 0.05), "% of the monitor width (←→ = 5%, or type e.g. 70)"),
+                it("dropdown.height", "Height", Percent(0.1, 1.0, 0.05), "% of the monitor height (←→ = 5%, or type e.g. 50)"),
                 it("dropdown.x", "X offset", Int(0, 10000, 10), "px inside the monitor (when not centered)"),
                 it("dropdown.y", "Y offset", Int(0, 10000, 10), "px inside the monitor (when not centered)"),
                 it("dropdown.monitor", "Initial monitor", Text, "e.g. DP-1; afterwards the last used monitor is remembered"),
@@ -275,6 +277,10 @@ fn set_capture(on: bool) {
 
 struct App {
     capture: Capture,
+    /// completion candidates for the field being edited
+    cands: Vec<String>,
+    cand_sel: Option<usize>,
+    cache: std::collections::HashMap<&'static str, Vec<String>>,
     sections: Vec<Section>,
     tab: usize,
     sel: Vec<ListState>,
@@ -306,6 +312,10 @@ impl App {
         match &item.kind {
             Kind::Binding(a) => keys::effective_combos(&self.cfg, a).join(", "),
             Kind::Palette(i) => hex(self.theme.table[*i]),
+            Kind::Percent(..) => {
+                let f = lookup(&self.eff, &item.path).and_then(|v| v.as_float()).unwrap_or(0.0);
+                format!("{}%", (f * 100.0).round())
+            }
             Kind::Color => {
                 let v = display(lookup(&self.eff, &item.path));
                 if v.is_empty() {
@@ -361,6 +371,17 @@ impl App {
                 Ok(v) => self.write(|d| confedit::set(d, &path, (v.clamp(min, max) * 100.0).round() / 100.0)),
                 Err(_) => self.status = "not a number".into(),
             },
+            Kind::Percent(min, max, _) => {
+                let t = input.trim_end_matches('%').trim().replace(',', ".");
+                match t.parse::<f64>() {
+                    // "70" / "70%" are percentages; "0.7" is a fraction
+                    Ok(v) => {
+                        let f = if v > 1.0 || input.contains('%') { v / 100.0 } else { v };
+                        self.write(|d| confedit::set(d, &path, (f.clamp(min, max) * 100.0).round() / 100.0))
+                    }
+                    Err(_) => self.status = "not a number".into(),
+                }
+            }
             Kind::Text | Kind::Choice(_) => {
                 if input.is_empty() && matches!(item.kind, Kind::Text) {
                     self.write(|d| confedit::remove(d, &path));
@@ -509,7 +530,217 @@ impl App {
                 let v = cur.parse::<f64>().unwrap_or(0.0) + dir as f64 * step;
                 self.set_value(item, &format!("{v:.3}"));
             }
+            Kind::Percent(_, _, step) => {
+                let f = lookup(&self.eff, &item.path).and_then(|v| v.as_float()).unwrap_or(0.5);
+                let v = ((f + dir as f64 * step) * 100.0).round();
+                self.set_value(item, &format!("{v}%"));
+            }
             _ => {}
+        }
+    }
+}
+
+fn cmd_lines(cmd: &str, args: &[&str]) -> Vec<String> {
+    std::process::Command::new(cmd)
+        .args(args)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().map(|l| l.to_string()).collect())
+        .unwrap_or_default()
+}
+
+fn font_names() -> Vec<String> {
+    let mut v: Vec<String> = cmd_lines("fc-list", &[":spacing=mono", "family"])
+        .into_iter()
+        .flat_map(|l| l.split(',').next().map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty())
+        .collect();
+    v.push("monospace".into());
+    v.sort_by_key(|s| s.to_lowercase());
+    v.dedup();
+    v
+}
+
+fn monitor_names() -> Vec<String> {
+    cmd_lines("xrandr", &["--listmonitors"]).iter().skip(1).filter_map(|l| l.split_whitespace().last().map(|s| s.to_string())).collect()
+}
+
+fn shells() -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_to_string("/etc/shells")
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.starts_with('/'))
+        .map(|l| l.to_string())
+        .collect();
+    v.dedup();
+    v
+}
+
+fn in_path(prog: &str) -> bool {
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).any(|d| d.join(prog).is_file()))
+        .unwrap_or(false)
+}
+
+fn browsers() -> Vec<String> {
+    ["xdg-open", "firefox", "google-chrome", "chromium", "chromium-browser", "brave-browser", "zen", "zen-browser", "microsoft-edge", "opera", "vivaldi"]
+        .iter()
+        .filter(|b| in_path(b))
+        .map(|s| s.to_string())
+        .collect()
+}
+
+const KEY_NAMES: &[&str] = &[
+    "ctrl", "shift", "alt", "super", "kitty_mod", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11",
+    "f12", "enter", "tab", "space", "backspace", "escape", "delete", "insert", "home", "end", "page_up", "page_down",
+    "left", "right", "up", "down", "comma", "period", "minus", "equal", "plus", "bracketleft", "bracketright", "slash",
+    "backslash", "grave", "semicolon", "apostrophe", "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n",
+    "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+];
+
+/// Complete a filesystem path: (directory part kept, entries)
+fn path_cands(token: &str) -> Vec<String> {
+    let home = dirs::home_dir().unwrap_or_default().display().to_string();
+    let expanded = if let Some(r) = token.strip_prefix('~') { format!("{home}{r}") } else { token.to_string() };
+    let (dir, _) = match expanded.rfind('/') {
+        Some(i) => (&expanded[..=i], &expanded[i + 1..]),
+        None => ("./", expanded.as_str()),
+    };
+    let shown_dir = match token.rfind('/') {
+        Some(i) => &token[..=i],
+        None => "",
+    };
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    Some(format!("{shown_dir}{name}{}", if is_dir { "/" } else { "" }))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+/// (fixed prefix of the buffer, token being completed)
+fn split_token(item: &Item, buf: &str) -> (String, String) {
+    match item.kind {
+        Kind::Hotkeys | Kind::Binding(_) => {
+            let i = buf.rfind(|c| c == '+' || c == ',').map(|i| i + 1).unwrap_or(0);
+            let tok = buf[i..].trim_start();
+            (buf[..buf.len() - tok.len()].to_string(), tok.to_string())
+        }
+        _ => (String::new(), buf.to_string()),
+    }
+}
+
+fn filter_cands(all: &[String], token: &str) -> Vec<String> {
+    let t = token.to_lowercase();
+    let mut v: Vec<String> = all.iter().filter(|c| c.to_lowercase().starts_with(&t)).cloned().collect();
+    if v.is_empty() && !t.is_empty() {
+        v = all.iter().filter(|c| c.to_lowercase().contains(&t)).cloned().collect();
+    }
+    v
+}
+
+fn common_prefix(v: &[String]) -> String {
+    let Some(first) = v.first() else { return String::new() };
+    let mut n = first.len();
+    for s in v.iter().skip(1) {
+        n = first.char_indices().zip(s.chars()).take_while(|((_, a), b)| a.eq_ignore_ascii_case(b)).count().min(n);
+    }
+    first.chars().take(n).collect()
+}
+
+impl App {
+    fn source(&mut self, item: &Item, token: &str) -> Vec<String> {
+        let path_like = token.starts_with('/') || token.starts_with('~') || token.starts_with('.');
+        let key: &'static str = match (item.path.as_str(), &item.kind) {
+            (_, Kind::Hotkeys) | (_, Kind::Binding(_)) => return KEY_NAMES.iter().map(|s| s.to_string()).collect(),
+            ("font_family", _) if path_like => return path_cands(token),
+            ("font_family", _) => "fonts",
+            ("dropdown.monitor", _) => "monitors",
+            ("shell", _) => "shells",
+            ("open_url_with", _) => "browsers",
+            ("working_dir", _) | ("command", _) if path_like => return path_cands(token),
+            ("working_dir", _) => return path_cands(&format!("~/{token}")),
+            (_, Kind::Choice(opts)) => return opts.iter().map(|s| s.to_string()).collect(),
+            _ => return Vec::new(),
+        };
+        self.cache
+            .entry(key)
+            .or_insert_with(|| match key {
+                "fonts" => font_names(),
+                "monitors" => monitor_names(),
+                "shells" => shells(),
+                _ => browsers(),
+            })
+            .clone()
+    }
+
+    /// Recompute candidates for the current edit buffer.
+    fn refresh_cands(&mut self) {
+        self.cand_sel = None;
+        self.cands.clear();
+        let (Some(buf), Some(item)) = (self.editing.clone(), self.item().cloned()) else { return };
+        let (_, token) = split_token(&item, &buf);
+        let all = self.source(&item, &token);
+        self.cands = filter_cands(&all, &token);
+        if self.cands.len() == 1 && self.cands[0] == token {
+            self.cands.clear();
+        }
+    }
+
+    /// Tab / Shift+Tab while editing.
+    fn complete(&mut self, back: bool) {
+        let (Some(buf), Some(item)) = (self.editing.clone(), self.item().cloned()) else { return };
+        if self.cands.is_empty() {
+            self.refresh_cands();
+            if self.cands.is_empty() {
+                self.status = "no completions".into();
+                return;
+            }
+        }
+        let (keep, token) = split_token(&item, &buf);
+        if self.cand_sel.is_none() {
+            let cp = common_prefix(&self.cands);
+            if self.cands.len() == 1 || cp.chars().count() > token.chars().count() {
+                let full = if self.cands.len() == 1 { self.cands[0].clone() } else { cp };
+                self.editing = Some(format!("{keep}{full}"));
+                let was_dir = full.ends_with('/');
+                self.refresh_cands();
+                if was_dir || self.cands.len() > 1 {
+                    return;
+                }
+                self.cands.clear();
+                return;
+            }
+        }
+        let n = self.cands.len();
+        let i = match self.cand_sel {
+            None => if back { n - 1 } else { 0 },
+            Some(i) => if back { (i + n - 1) % n } else { (i + 1) % n },
+        };
+        self.cand_sel = Some(i);
+        // keep = everything before the token of the *original* text
+        let (keep, _) = split_token(&item, &buf);
+        self.editing = Some(format!("{keep}{}", self.cands[i]));
+    }
+
+    /// Remainder of the best candidate (shown dimmed after the cursor).
+    fn ghost(&self) -> String {
+        let (Some(buf), Some(item)) = (self.editing.as_ref(), self.item()) else { return String::new() };
+        if self.cand_sel.is_some() {
+            return String::new();
+        }
+        let (_, token) = split_token(item, buf);
+        match self.cands.first() {
+            Some(c) if !token.is_empty() && c.to_lowercase().starts_with(&token.to_lowercase()) => {
+                c.chars().skip(token.chars().count()).collect()
+            }
+            _ => String::new(),
         }
     }
 }
@@ -526,6 +757,9 @@ fn swatch(s: &str) -> Option<Color> {
 pub fn run(section: Option<String>) -> anyhow::Result<()> {
     let mut app = App {
         capture: None,
+        cands: Vec::new(),
+        cand_sel: None,
+        cache: Default::default(),
         sections: sections(),
         tab: 0,
         sel: Vec::new(),
@@ -594,7 +828,7 @@ pub fn run(section: Option<String>) -> anyhow::Result<()> {
                         " {}: PRESS THE NEW KEY COMBINATION…   (Esc: cancel)",
                         app.item().map(|i| i.label.trim().to_string()).unwrap_or_default()
                     ),
-                    (Some(buf), Some(item)) => format!(" {}: {buf}▏   Enter: save   Esc: cancel", item.label.trim()),
+                    (Some(_), Some(_)) => String::new(),
                     (None, Some(item)) if matches!(item.kind, Kind::Binding(_)) => {
                         " Enter: press new key   a: add another key   e: type keys   x: unbind   r: default\n Tab/Shift+Tab: section  ↑↓: select  q: quit".to_string()
                     }
@@ -604,7 +838,42 @@ pub fn run(section: Option<String>) -> anyhow::Result<()> {
                     ),
                     _ => String::new(),
                 };
-                f.render_widget(Paragraph::new(help_text), help);
+                if let (Some(buf), Some(item)) = (&app.editing, app.item()) {
+                    let ghost = app.ghost();
+                    let line1 = Line::from(vec![
+                        Span::raw(format!(" {}: ", item.label.trim())),
+                        Span::styled(buf.clone(), Style::default().fg(Color::Yellow)),
+                        Span::styled("▏", Style::default().fg(Color::White)),
+                        Span::styled(ghost, Style::default().fg(Color::DarkGray)),
+                    ]);
+                    let width = help.width as usize;
+                    let mut spans = vec![Span::raw(" ")];
+                    let mut used = 1usize;
+                    let shown = app.cands.len();
+                    for (i, c) in app.cands.iter().enumerate() {
+                        let w = c.chars().count() + 2;
+                        if used + w + 12 > width {
+                            spans.push(Span::styled(format!("… +{} more", shown - i), Style::default().fg(Color::DarkGray)));
+                            break;
+                        }
+                        let st = if app.cand_sel == Some(i) {
+                            Style::default().fg(Color::Black).bg(Color::Cyan)
+                        } else {
+                            Style::default().fg(Color::Cyan)
+                        };
+                        spans.push(Span::styled(c.clone(), st));
+                        spans.push(Span::raw("  "));
+                        used += w;
+                    }
+                    let line2 = if app.cands.is_empty() {
+                        Line::from(Span::styled(" Tab: complete   →: accept suggestion   Enter: save   Esc: cancel", Style::default().fg(Color::DarkGray)))
+                    } else {
+                        Line::from(spans)
+                    };
+                    f.render_widget(Paragraph::new(vec![line1, line2]), help);
+                } else {
+                    f.render_widget(Paragraph::new(help_text), help);
+                }
                 f.render_widget(Paragraph::new(Span::styled(format!(" {}", app.status), Style::default().fg(Color::Green))), status);
             })?;
 
@@ -630,17 +899,39 @@ pub fn run(section: Option<String>) -> anyhow::Result<()> {
             if let Some(buf) = app.editing.as_mut() {
                 match k.code {
                     KeyCode::Enter => {
+                        app.cands.clear();
                         let input = app.editing.take().unwrap_or_default();
                         if let Some(item) = app.item().cloned() {
                             app.set_value(&item, &input);
                         }
                     }
-                    KeyCode::Esc => app.editing = None,
+                    KeyCode::Esc => {
+                        app.editing = None;
+                        app.cands.clear();
+                    }
+                    KeyCode::Tab => app.complete(false),
+                    KeyCode::BackTab => app.complete(true),
+                    KeyCode::Right | KeyCode::End => {
+                        let g = app.ghost();
+                        if !g.is_empty() {
+                            if let Some(b) = app.editing.as_mut() {
+                                b.push_str(&g);
+                            }
+                            app.refresh_cands();
+                        }
+                    }
                     KeyCode::Backspace => {
                         buf.pop();
+                        app.refresh_cands();
                     }
-                    KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => buf.clear(),
-                    KeyCode::Char(c) => buf.push(c),
+                    KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                        buf.clear();
+                        app.refresh_cands();
+                    }
+                    KeyCode::Char(c) => {
+                        buf.push(c);
+                        app.refresh_cands();
+                    }
                     _ => {}
                 }
                 continue;
@@ -666,7 +957,10 @@ pub fn run(section: Option<String>) -> anyhow::Result<()> {
                 {
                     let Some(Kind::Binding(action)) = app.item().map(|i| i.kind.clone()) else { continue };
                     match k.code {
-                        KeyCode::Char('e') => app.editing = Some(keys::effective_combos(&app.cfg, action).join(", ")),
+                        KeyCode::Char('e') => {
+                            app.editing = Some(keys::effective_combos(&app.cfg, action).join(", "));
+                            app.refresh_cands();
+                        }
                         KeyCode::Char('x') => {
                             app.rebind(action, Vec::new());
                             app.status = "unbound".into();
@@ -683,8 +977,9 @@ pub fn run(section: Option<String>) -> anyhow::Result<()> {
                             Kind::Bool | Kind::Choice(_) => app.adjust(&item, 1),
                             _ => {
                                 let v = app.value_of(&item);
-                                let v = v.trim_end_matches(" (scheme)").to_string();
+                                let v = v.trim_end_matches(" (scheme)").trim_end_matches('%').to_string();
                                 app.editing = Some(v);
+                                app.refresh_cands();
                             }
                         }
                     }
