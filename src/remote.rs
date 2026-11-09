@@ -135,14 +135,19 @@ done"#,
         Ok(out.stdout)
     }
 
-    /// Upload bytes into ~/.cache/dtem/uploads on the remote; returns the absolute remote path.
-    pub fn upload(&self, data: &[u8], name: &str) -> anyhow::Result<String> {
+    /// Upload bytes to the remote; returns the absolute remote path.
+    /// Clipboard images go to a private temp dir (0700, files 0600, removed after 24h);
+    /// other files go to ~/.cache/dtem/uploads.
+    pub fn upload(&self, data: &[u8], name: &str, clipboard_image: bool) -> anyhow::Result<String> {
         let name: String =
             name.chars().map(|c| if c.is_ascii_alphanumeric() || "-_.".contains(c) { c } else { '_' }).collect();
-        let script = format!(
-            "d=\"$HOME/.cache/dtem/uploads\"; mkdir -p \"$d\" && cat > \"$d\"/{n} && printf '%s' \"$d\"/{n}",
-            n = shell_quote(&name)
-        );
+        let dir = if clipboard_image {
+            "d=\"${TMPDIR:-/tmp}/dtem-clipboard-$(id -u)\"; umask 077; mkdir -p \"$d\" && chmod 700 \"$d\" && \
+             find \"$d\" -type f -mmin +1440 -delete 2>/dev/null;"
+        } else {
+            "d=\"$HOME/.cache/dtem/uploads\"; mkdir -p \"$d\" &&"
+        };
+        let script = format!("{dir} cat > \"$d\"/{n} && printf '%s' \"$d\"/{n}", n = shell_quote(&name));
         let out = self.run(&script, Some(data))?;
         let path = String::from_utf8_lossy(&out).trim().to_string();
         if path.is_empty() {

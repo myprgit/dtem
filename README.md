@@ -45,7 +45,7 @@ Opens an ssh session in a new tab. The session is multiplexed through an SSH Con
 
 | What | How |
 |---|---|
-| Local image → remote | Copy an image (e.g. a screenshot) and press `kitty_mod+v` in the ssh pane. dtem uploads it to `~/.cache/dtem/uploads/` on the server and types its path, which is handy for CLI tools that take image paths. |
+| Local image → remote | Copy an image (e.g. a screenshot) and press `kitty_mod+v` in the ssh pane. It works like herdr: the image is staged in a private temp dir on the server (`/tmp/dtem-clipboard-<uid>/`, mode 0600, removed after 24 h) and its bare path is pasted. Agents such as Claude Code attach it as an image. |
 | Local files → remote | Copy files in the file manager and paste, or drag & drop them onto the pane. They are uploaded and their paths are typed. |
 | Remote text → local clipboard | `echo hi \| dtem-copy`, or any program using OSC 52 (nvim, tmux with `set-clipboard on`). |
 | Remote image/file → local clipboard | `dtem-copy shot.png`. Images go on your clipboard as images. Other files are saved to `~/Downloads/dtem/` and copied as files. |
@@ -55,7 +55,7 @@ Opens an ssh session in a new tab. The session is multiplexed through an SSH Con
 - **Manually started ssh:** if you start `ssh host` yourself inside a local pane, image/file paste still works through a separate `ssh -o BatchMode=yes` connection. That connection needs key or agent authentication.
 - **Disconnect:** the pane offers to reconnect.
 - **After restore:** remote tabs come back with their scrollback and ask before reconnecting. Programs are never restarted.
-- **Local panes:** pasting an image saves it under `~/.cache/dtem/clipboard/` and types the local path.
+- **Local panes:** pasting an image stages it the same way in a local temp dir and pastes the path.
 
 ## Dropdown and monitors
 

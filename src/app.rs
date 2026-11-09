@@ -2346,21 +2346,15 @@ impl App {
                 return true;
             }
         };
-        let name = format!("clip-{}.png", timestamp());
+        let name = format!("clipboard-{}.png", timestamp());
         let remote = self.panes.get(&pane).and_then(|p| p.remote_target());
         match remote {
-            Some(r) => self.upload(wid, pane, r, vec![(name, png)]),
-            None => {
-                let dir = dirs::cache_dir().unwrap_or_else(std::env::temp_dir).join("dtem/clipboard");
-                let path = dir.join(&name);
-                match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &png)) {
-                    Ok(_) => {
-                        self.paste_into(pane, &remote::shell_quote(&path.display().to_string()));
-                        self.toast(wid, format!("Image saved: {}", path.display()));
-                    }
-                    Err(e) => self.toast(wid, format!("Cannot save image: {e}")),
-                }
-            }
+            Some(r) => self.upload(wid, pane, r, vec![(name, png)], true),
+            None => match stage_local_image(&name, &png) {
+                // Same as a remote paste: the image path, nothing else (agents attach it as an image)
+                Ok(path) => self.paste_into(pane, &path.display().to_string()),
+                Err(e) => self.toast(wid, format!("Cannot save image: {e}")),
+            },
         }
         true
     }
@@ -2377,7 +2371,7 @@ impl App {
                     }
                 }
                 if !items.is_empty() {
-                    self.upload(wid, pane, r, items);
+                    self.upload(wid, pane, r, items, false);
                 }
             }
             None => {
@@ -2387,15 +2381,18 @@ impl App {
         }
     }
 
-    /// Upload in the background, then type the remote paths into the pane.
-    fn upload(&mut self, wid: WindowId, pane: u64, r: Remote, items: Vec<(String, Vec<u8>)>) {
+    /// Upload in the background, then paste the remote path(s) into the pane.
+    /// Clipboard images are pasted as the bare path (like a local paste) and stay quiet.
+    fn upload(&mut self, wid: WindowId, pane: u64, r: Remote, items: Vec<(String, Vec<u8>)>, clipboard_image: bool) {
         let total: usize = items.iter().map(|(_, d)| d.len()).sum();
-        self.toast(wid, format!("Uploading {} file(s), {} to {}…", items.len(), human_size(total), r.label()));
+        if !clipboard_image || total > 2 << 20 {
+            self.toast(wid, format!("Uploading {} file(s), {} to {}…", items.len(), human_size(total), r.label()));
+        }
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
             let mut paths = Vec::new();
             for (name, data) in items {
-                match r.upload(&data, &name) {
+                match r.upload(&data, &name, clipboard_image) {
                     Ok(p) => paths.push(remote::shell_quote(&p)),
                     Err(e) => {
                         let _ = proxy.send_event(UserEvent::Toast(pane, format!("Upload failed: {e}")));
@@ -2404,8 +2401,12 @@ impl App {
                 }
             }
             let n = paths.len();
-            let _ = proxy.send_event(UserEvent::InsertText(pane, format!("{} ", paths.join(" "))));
-            let _ = proxy.send_event(UserEvent::Toast(pane, format!("Uploaded {n} file(s) to {}", r.label())));
+            if clipboard_image {
+                let _ = proxy.send_event(UserEvent::InsertText(pane, paths.join(" ")));
+            } else {
+                let _ = proxy.send_event(UserEvent::InsertText(pane, format!("{} ", paths.join(" "))));
+                let _ = proxy.send_event(UserEvent::Toast(pane, format!("Uploaded {n} file(s) to {}", r.label())));
+            }
         });
     }
 
@@ -2551,6 +2552,27 @@ impl App {
             Err(e) => log::error!("cannot open {url}: {e}"),
         }
     }
+}
+
+/// Write a pasted image to a private temp dir (0700/0600), dropping files older than 24h.
+fn stage_local_image(name: &str, data: &[u8]) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let dir = std::env::temp_dir().join(format!("dtem-clipboard-{}", unsafe { libc::geteuid() }));
+    std::fs::create_dir_all(&dir)?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let old = e.metadata().and_then(|m| m.modified()).map(|t| t.elapsed().unwrap_or_default());
+            if old.map(|d| d > Duration::from_secs(24 * 3600)).unwrap_or(false) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    let path = dir.join(name);
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
+    f.write_all(data)?;
+    Ok(path)
 }
 
 fn timestamp() -> String {
