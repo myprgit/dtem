@@ -93,6 +93,10 @@ struct OsWin {
     hints: Option<Hints>,
     /// Dropdown: fullscreen state when it was last hidden (restored on show)
     was_fullscreen: bool,
+    /// Moves caused by our own show/fullscreen requests are not "the user moved it"
+    ignore_moves_until: Option<Instant>,
+    /// Re-apply the dropdown geometry after the WM restored it (leaving fullscreen)
+    reapply_geometry_at: Option<Instant>,
     cursor: (f64, f64),
     left_down: bool,
     selecting: Option<u64>,
@@ -412,6 +416,8 @@ impl App {
                 bell_at: None,
                 menu: None,
                 hints: None,
+                ignore_moves_until: None,
+                reapply_geometry_at: None,
                 was_fullscreen: dropdown && (ws.map(|w| w.fullscreen).unwrap_or(false) || self.dd().start_fullscreen),
                 cursor: (0.0, 0.0),
                 left_down: false,
@@ -874,6 +880,9 @@ impl App {
 
     fn show_dropdown(&mut self, el: &ActiveEventLoop, wid: WindowId) {
         self.pending_hide = None;
+        if let Some(w) = self.windows.get_mut(&wid) {
+            w.ignore_moves_until = Some(Instant::now() + Duration::from_millis(800));
+        }
         self.apply_dropdown_geometry(el, wid);
         let d = self.dd();
         let name = self.windows.get(&wid).and_then(|w| w.monitor.clone());
@@ -914,19 +923,32 @@ impl App {
             win.window.focus_window();
         }
         if fullscreen {
-            self.set_fullscreen(wid, true);
+            self.set_fullscreen(wid, true, mon.clone());
         }
     }
 
     /// Enter/leave fullscreen (the WM's real fullscreen, on the window's monitor).
-    fn set_fullscreen(&mut self, wid: WindowId, on: bool) {
-        let Some(w) = self.windows.get(&wid) else { return };
+    /// `mon`: monitor to go fullscreen on (dropdowns pass their remembered monitor — the
+    /// window's "current monitor" can be stale right after it was shown).
+    fn set_fullscreen(&mut self, wid: WindowId, on: bool, mon: Option<MonitorHandle>) {
+        let Some(w) = self.windows.get_mut(&wid) else { return };
+        w.ignore_moves_until = Some(Instant::now() + Duration::from_millis(800));
         if on {
-            let mon = w.window.current_monitor();
+            let mon = mon.or_else(|| w.window.current_monitor());
             w.window.set_fullscreen(Some(Fullscreen::Borderless(mon)));
         } else {
             w.window.set_fullscreen(None);
+            if w.dropdown {
+                // the WM restores the pre-fullscreen geometry asynchronously; put it back after
+                w.reapply_geometry_at = Some(Instant::now() + Duration::from_millis(250));
+            }
         }
+    }
+
+    /// The dropdown's remembered monitor (or the primary one).
+    fn dropdown_monitor(&self, el: &ActiveEventLoop, wid: WindowId) -> Option<MonitorHandle> {
+        let name = self.windows.get(&wid).and_then(|w| w.monitor.clone());
+        Self::monitor_by_name(el, name.as_deref()).or_else(|| Self::fallback_monitor(el))
     }
 
     fn hide_dropdown(&mut self, wid: WindowId) {
@@ -937,7 +959,7 @@ impl App {
             win.was_fullscreen = win.window.fullscreen().is_some();
             if win.was_fullscreen {
                 // leave fullscreen before unmapping so the WM restores it cleanly next time
-                self.set_fullscreen(wid, false);
+                self.set_fullscreen(wid, false, None);
                 let win = self.windows.get_mut(&wid).unwrap();
                 win.window.set_visible(false);
                 win.visible = false;
@@ -1423,8 +1445,9 @@ impl App {
             }
             Action::ToggleFullscreen => {
                 let w = &self.windows[&wid];
-                let on = !(w.window.fullscreen().is_some());
-                self.set_fullscreen(wid, on);
+                let on = w.window.fullscreen().is_none();
+                let mon = if w.dropdown { self.dropdown_monitor(el, wid) } else { None };
+                self.set_fullscreen(wid, on, mon);
                 if !on && self.windows[&wid].dropdown {
                     self.apply_dropdown_geometry(el, wid);
                 }
@@ -3129,15 +3152,19 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Moved(pos) => {
                 let win = self.windows.get_mut(&wid).unwrap();
                 win.pos = Some((pos.x, pos.y));
-                if win.dropdown && win.visible {
-                    // Track the monitor the dropdown was moved to (e.g. Super+Shift+Arrow)
+                let own_move = win.ignore_moves_until.map(|t| Instant::now() < t).unwrap_or(false);
+                if win.dropdown && win.visible && !own_move && win.reapply_geometry_at.is_none() {
+                    // Track the monitor the user moved the dropdown to (e.g. Super+Shift+Arrow)
                     let size = win.window.outer_size();
                     let cx = pos.x + size.width as i32 / 2;
-                    let cy = pos.y + 10;
+                    let cy = pos.y + size.height.min(20) as i32 / 2;
                     if let Some(m) = Self::monitor_at(el, cx, cy) {
                         if m.name() != win.monitor {
                             win.monitor = m.name();
-                            self.apply_dropdown_geometry(el, wid);
+                            // a fullscreen window stays fullscreen on the new monitor
+                            if win.window.fullscreen().is_none() {
+                                self.apply_dropdown_geometry(el, wid);
+                            }
                         }
                     }
                 }
@@ -3237,6 +3264,21 @@ impl ApplicationHandler<UserEvent> for App {
         }
         let mut next = self.last_save + interval;
         if let Some(t) = self.step_anim(el) {
+            next = next.min(t);
+        }
+        let now = Instant::now();
+        let due: Vec<WindowId> =
+            self.windows.iter().filter(|(_, w)| w.reapply_geometry_at.map(|t| now >= t).unwrap_or(false)).map(|(id, _)| *id).collect();
+        for wid in due {
+            if let Some(w) = self.windows.get_mut(&wid) {
+                w.reapply_geometry_at = None;
+                w.ignore_moves_until = Some(now + Duration::from_millis(500));
+            }
+            if self.windows.get(&wid).map(|w| w.visible && w.window.fullscreen().is_none()).unwrap_or(false) {
+                self.apply_dropdown_geometry(el, wid);
+            }
+        }
+        if let Some(t) = self.windows.values().filter_map(|w| w.reapply_geometry_at).min() {
             next = next.min(t);
         }
 
