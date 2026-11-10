@@ -115,6 +115,8 @@ pub struct Config {
     pub shell_integration: bool,
     /// Each tab keeps its own shell history (needs shell integration)
     pub separate_history: bool,
+    /// Grey suggestions while typing / completion preview (bash: ble.sh in ~/.local/share/blesh)
+    pub autosuggestions: bool,
 
     // ---- session
     pub persist_scrollback: bool,
@@ -296,6 +298,7 @@ impl Default for Config {
             notify_programs: true,
             shell_integration: true,
             separate_history: true,
+            autosuggestions: true,
             persist_scrollback: true,
             persist_scrollback_lines: 10_000,
             autosave_interval_secs: 5,

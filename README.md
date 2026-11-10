@@ -47,6 +47,7 @@ bash, zsh and fish are started with a small integration script. Your own `.bashr
 | long-running command notifications | see above |
 | ssh tabs | the remote directory is remembered; after a restart, reconnecting opens there |
 | separate history | every tab has its own command history (Up arrow), kept across restarts; new tabs start from `~/.bash_history` (`separate_history`) |
+| suggestions while typing | bash: install [ble.sh](https://github.com/akinomyoga/ble.sh) into `~/.local/share/blesh` and dtem loads it (dim suggestion, → accepts, Tab shows candidates, syntax colors); `autosuggestions = false` turns it off |
 
 On hosts opened with `dtem --remote`, the integration, `dtem-copy` and `dtem-icat` are installed into `~/.local` automatically.
 

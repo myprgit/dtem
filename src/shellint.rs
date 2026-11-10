@@ -8,6 +8,12 @@ pub const FISH: &str = include_str!("shell/dtem.fish");
 pub const LAUNCHER: &str = include_str!("shell/dtem-shell");
 pub const ICAT: &str = include_str!("shell/dtem-icat");
 
+/// ble.sh (fish-like suggestions for bash) if installed.
+pub fn blesh() -> Option<PathBuf> {
+    let p = dirs::data_dir()?.join("blesh/ble.sh");
+    p.is_file().then_some(p)
+}
+
 pub fn dir() -> PathBuf {
     dirs::data_dir().unwrap_or_else(std::env::temp_dir).join("dtem/shell")
 }

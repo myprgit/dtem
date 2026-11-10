@@ -1,4 +1,9 @@
 # dtem shell integration for bash (loaded via --rcfile; your own startup files are sourced first)
+
+# fish-like suggestions while typing (ble.sh) — loaded before your files, attached at the end
+if [[ $- == *i* && -n "$DTEM_BLESH" && -f "$DTEM_BLESH" && -z "${BLE_VERSION-}" ]]; then
+  source "$DTEM_BLESH" --attach=none
+fi
 if [ -n "$DTEM_BASH_LOGIN" ]; then
   unset DTEM_BASH_LOGIN
   [ -r /etc/profile ] && . /etc/profile
@@ -50,9 +55,19 @@ if [[ $- == *i* && -z "$__dtem_loaded" ]]; then
   else
     PROMPT_COMMAND="__dtem_precmd${PROMPT_COMMAND:+; $PROMPT_COMMAND}; __dtem_prompt"
   fi
-  if [ -n "${bash_preexec_imported:-}" ] || declare -F __bp_install >/dev/null 2>&1; then
+  if [[ ${BLE_VERSION-} ]]; then
+    blehook PREEXEC+=__dtem_start
+  elif [ -n "${bash_preexec_imported:-}" ] || declare -F __bp_install >/dev/null 2>&1; then
     preexec_functions+=(__dtem_start)
   else
     trap '__dtem_preexec' DEBUG
   fi
+fi
+
+if [[ ${BLE_VERSION-} ]]; then
+  # fish-like dim suggestion text (unless you configure ble.sh yourself)
+  if [ ! -f ~/.blerc ] && [ ! -f "${XDG_CONFIG_HOME:-$HOME/.config}/blesh/init.sh" ]; then
+    ble-face auto_complete='fg=244'
+  fi
+  ble-attach
 fi

@@ -134,6 +134,7 @@ fn sections() -> Vec<Section> {
                 it("shell", "Shell", Text, "empty = $SHELL"),
                 it("shell_integration", "Shell integration", Bool, "prompt jumps, last output copy, command notifications, remote cwd (new tabs)"),
                 it("separate_history", "Separate history per tab", Bool, "each tab has its own command history (new tabs; needs shell integration)"),
+                it("autosuggestions", "Suggestions while typing", Bool, "grey preview of what Tab/→ completes (bash: needs ble.sh; new tabs)"),
                 it("login_shell", "Login shell", Bool, ""),
                 it("command", "Command for new tabs", Text, "empty = just the shell"),
                 it("command_exit", "When command exits", Choice(&["shell", "restart", "close"]), ""),

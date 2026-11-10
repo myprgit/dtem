@@ -160,6 +160,11 @@ impl Pane {
                 match integrated {
                     Some((args, extra_env)) => {
                         env.extend(extra_env);
+                        if cfg.autosuggestions {
+                            if let Some(b) = crate::shellint::blesh() {
+                                env.insert("DTEM_BLESH".into(), b.display().to_string());
+                            }
+                        }
                         if cfg.separate_history {
                             // every tab keeps its own history (survives restarts with the session)
                             let hp = history_path(&persist_id);
