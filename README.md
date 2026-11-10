@@ -19,6 +19,37 @@ GPU-accelerated terminal emulator. It runs as a normal window or as a dropdown, 
 - **Transparency:** background opacity is configurable (needs a compositor).
 - **`dtem --remote`:** SSH with clipboard and file sync (see below).
 
+## Install on any PC
+
+dtem is a single self-contained binary. JetBrains Mono, ble.sh, the shell integration and the notification client are all built in. It runs on any x86_64 or arm64 Linux desktop with glibc ≥ 2.30 (Ubuntu 20.04+, Debian 11+, Fedora 32+, …). Neither Rust nor this repository is needed on the target machine.
+
+```bash
+# single binary
+chmod +x dtem-0.1.0-x86_64 && ./dtem-0.1.0-x86_64 --install
+# or the Debian/Ubuntu package
+sudo apt install ./dtem_0.1.0-1_amd64.deb && dtem --install
+```
+
+`dtem --install` sets up the following for the current user:
+- the binary in `~/.local/bin` (unless it came from the .deb),
+- a menu entry,
+- the dropdown at login,
+- the GNOME hotkeys,
+- the shell integration and ble.sh.
+
+`dtem --uninstall [--purge]` removes them again.
+
+Take your settings along:
+
+```bash
+dtem --export-config            # → dtem-config.tar.gz (dtem.toml, saved layouts, ~/.blerc)
+dtem --import-config dtem-config.tar.gz   # on the other PC (old config is backed up)
+```
+
+To build the artifacts yourself, run `scripts/build-dist.sh`. It writes `dist/` with both binaries, both .deb packages and SHA256SUMS. It needs cargo-zigbuild, zig and cargo-deb.
+
+Ctrl+R (at a shell prompt) opens dtem's fuzzy history search over **all tabs**; press Ctrl+R again to search **this tab only**. Enter puts the command on the prompt without running it. When vim, less, ssh or another program is in the foreground, Ctrl+R goes to that program.
+
 ## Coming from tilda
 
 ```

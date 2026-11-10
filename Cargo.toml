@@ -2,6 +2,30 @@
 name = "dtem"
 version = "0.1.0"
 edition = "2024"
+description = "GPU accelerated terminal with dropdown mode, splits, session restore and ssh clipboard sync"
+authors = ["Mehmet Yapar <mehmetyapar@windowslive.com>"]
+
+[package.metadata.deb]
+section = "x11"
+priority = "optional"
+depends = "libc6 (>= 2.30)"
+recommends = "fontconfig, xdg-utils"
+extended-description = """dtem is a GPU accelerated terminal emulator: tabs and split panes, a dropdown
+mode bound to a global hotkey, full session restore across reboots, kitty-style key
+bindings, ligatures, images (kitty graphics protocol), shell integration and ssh with
+clipboard/image sync. After installing, every user runs `dtem --install` once."""
+maintainer-scripts = "packaging/"
+assets = [
+    ["target/release/dtem", "usr/bin/", "755"],
+    ["packaging/dtem.desktop", "usr/share/applications/", "644"],
+    ["README.md", "usr/share/doc/dtem/README.md", "644"],
+    ["dtem.example.toml", "usr/share/doc/dtem/dtem.example.toml", "644"],
+    ["assets/fonts/JetBrainsMono-OFL.txt", "usr/share/doc/dtem/licenses/JetBrainsMono-OFL.txt", "644"],
+    ["packaging/blesh-LICENSE.md", "usr/share/doc/dtem/licenses/blesh-LICENSE.md", "644"],
+]
+
+[profile.release]
+strip = true
 
 [dependencies]
 alacritty_terminal = "0.26.0"

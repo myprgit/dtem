@@ -1,0 +1,18 @@
+[Desktop Entry]
+Type=Application
+Name=dtem
+Comment=GPU accelerated terminal
+Exec=dtem
+Icon=utilities-terminal
+Terminal=false
+Categories=System;TerminalEmulator;
+StartupWMClass=dtem
+Actions=dropdown;settings;
+
+[Desktop Action dropdown]
+Name=Toggle dropdown
+Exec=dtem --toggle
+
+[Desktop Action settings]
+Name=Settings
+Exec=dtem --settings
