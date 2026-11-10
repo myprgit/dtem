@@ -64,15 +64,21 @@ impl App {
         let body = body.to_string();
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
-            let out = std::process::Command::new("notify-send")
-                .args(["-a", "dtem", "-i", "utilities-terminal", "-A", "default=Show"])
-                .arg(&title)
-                .arg(&body)
-                .output();
-            if let Ok(o) = out {
-                if String::from_utf8_lossy(&o.stdout).trim() == "default" {
-                    let _ = proxy.send_event(UserEvent::FocusPane(pane));
-                }
+            // D-Bus (org.freedesktop.Notifications) — no notify-send needed
+            let shown = notify_rust::Notification::new()
+                .appname("dtem")
+                .icon("utilities-terminal")
+                .summary(&title)
+                .body(&body)
+                .action("default", "Show")
+                .show();
+            match shown {
+                Ok(handle) => handle.wait_for_action(|action| {
+                    if action == "default" {
+                        let _ = proxy.send_event(UserEvent::FocusPane(pane));
+                    }
+                }),
+                Err(e) => log::warn!("notification failed: {e}"),
             }
         });
     }
