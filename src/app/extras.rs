@@ -497,3 +497,222 @@ pub(super) fn hint_regexes() -> Vec<(HintKind, regex::Regex)> {
         (HintKind::Hash, r(r"\b[0-9a-f]{7,40}\b")),
     ]
 }
+
+// ------------------------------------------------------------ Ctrl+R: history search
+
+pub(super) struct HistSearch {
+    pub pane: u64,
+    /// all tabs (+ ~/.bash_history) or only this tab
+    pub all: bool,
+    pub query: String,
+    pub items: Vec<String>,
+    /// (item index, matched char positions)
+    pub matches: Vec<(usize, Vec<usize>)>,
+    pub sel: usize,
+}
+
+fn read_history_file(path: &std::path::Path, out: &mut Vec<String>) {
+    let Ok(data) = std::fs::read(path) else { return };
+    let text = String::from_utf8_lossy(&data);
+    let fish = path.to_string_lossy().contains("fish");
+    let mut v: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end();
+        if fish {
+            if let Some(c) = line.strip_prefix("- cmd: ") {
+                v.push(c.replace("\\n", "\n").replace("\\\\", "\\"));
+            }
+            continue;
+        }
+        // bash timestamps (#1699999999) and zsh extended history (: 1699999999:0;cmd)
+        if line.starts_with('#') && line[1..].chars().all(|c| c.is_ascii_digit()) && line.len() > 1 {
+            continue;
+        }
+        let cmd = if line.starts_with(": ") && line.contains(';') { line.splitn(2, ';').nth(1).unwrap_or("") } else { line };
+        if !cmd.trim().is_empty() {
+            v.push(cmd.to_string());
+        }
+    }
+    // newest last in the file → newest first
+    v.reverse();
+    out.extend(v);
+}
+
+/// Subsequence fuzzy match: score (higher is better) and matched char positions.
+pub(super) fn fuzzy(query: &str, cand: &str) -> Option<(i64, Vec<usize>)> {
+    if query.is_empty() {
+        return Some((0, vec![]));
+    }
+    let q: Vec<char> = query.to_lowercase().chars().collect();
+    let c: Vec<char> = cand.chars().collect();
+    let cl: Vec<char> = cand.to_lowercase().chars().collect();
+    if cl.len() != c.len() {
+        return None;
+    }
+    // prefer a contiguous substring match
+    let joined: String = q.iter().collect();
+    let lower: String = cl.iter().collect();
+    if let Some(byte) = lower.find(&joined) {
+        let start = lower[..byte].chars().count();
+        let word_start = start == 0 || !cl[start - 1].is_alphanumeric();
+        let score = 1000 + if word_start { 200 } else { 0 } - start as i64 - c.len() as i64 / 4;
+        return Some((score, (start..start + q.len()).collect()));
+    }
+    let mut pos = Vec::with_capacity(q.len());
+    let mut qi = 0;
+    let mut score = 0i64;
+    let mut last: Option<usize> = None;
+    for (i, ch) in cl.iter().enumerate() {
+        if qi < q.len() && *ch == q[qi] {
+            score += match last {
+                Some(l) if l + 1 == i => 15,
+                _ => 1,
+            };
+            if i == 0 || !cl[i - 1].is_alphanumeric() {
+                score += 10;
+            }
+            if let Some(l) = last {
+                score -= (i - l - 1).min(10) as i64;
+            }
+            pos.push(i);
+            last = Some(i);
+            qi += 1;
+        }
+    }
+    (qi == q.len()).then(|| (score - c.len() as i64 / 8, pos))
+}
+
+impl App {
+    fn history_items(&self, pane: u64, all: bool) -> Vec<String> {
+        let mut raw = Vec::new();
+        let own = self.panes.get(&pane).and_then(|p| p.history_file.clone());
+        if let Some(f) = &own {
+            read_history_file(f, &mut raw);
+        }
+        if all || own.is_none() {
+            let dir = crate::config::state_dir().join("history");
+            let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = std::fs::read_dir(&dir)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter(|e| Some(e.path()) != own)
+                        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            files.sort_by(|a, b| b.0.cmp(&a.0));
+            for (_, f) in files {
+                read_history_file(&f, &mut raw);
+            }
+            if let Some(h) = dirs::home_dir() {
+                for f in [".bash_history", ".zsh_history", ".local/share/fish/fish_history"] {
+                    read_history_file(&h.join(f), &mut raw);
+                }
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        raw.into_iter().filter(|c| seen.insert(c.clone())).take(50_000).collect()
+    }
+
+    /// Is the pane's shell waiting at its prompt (no program in the foreground)?
+    pub(super) fn shell_idle(&self, pane: u64) -> bool {
+        self.panes.get(&pane).map(|p| p.shell_idle() && p.remote.is_none()).unwrap_or(false)
+    }
+
+    pub(super) fn open_history_search(&mut self, wid: WindowId) {
+        let Some(id) = self.active_pane_id(wid) else { return };
+        let items = self.history_items(id, true);
+        let mut hs = HistSearch { pane: id, all: true, query: String::new(), items, matches: vec![], sel: 0 };
+        refilter(&mut hs);
+        let w = self.windows.get_mut(&wid).unwrap();
+        w.hist = Some(hs);
+        w.window.request_redraw();
+    }
+
+    pub(super) fn history_key(&mut self, wid: WindowId, ev: &KeyEvent) -> bool {
+        let ctrl = self.modifiers.control_key();
+        let Some(w) = self.windows.get_mut(&wid) else { return false };
+        let Some(hs) = w.hist.as_mut() else { return false };
+        let n = hs.matches.len();
+        match &ev.logical_key {
+            Key::Named(NamedKey::Escape) => w.hist = None,
+            Key::Character(c) if ctrl && c.eq_ignore_ascii_case("g") => w.hist = None,
+            Key::Named(NamedKey::ArrowUp) => hs.sel = if n == 0 { 0 } else { (hs.sel + 1).min(n - 1) },
+            Key::Named(NamedKey::ArrowDown) => hs.sel = hs.sel.saturating_sub(1),
+            Key::Character(c) if ctrl && c.eq_ignore_ascii_case("p") => hs.sel = if n == 0 { 0 } else { (hs.sel + 1).min(n - 1) },
+            Key::Character(c) if ctrl && c.eq_ignore_ascii_case("n") => hs.sel = hs.sel.saturating_sub(1),
+            Key::Named(NamedKey::PageUp) => hs.sel = if n == 0 { 0 } else { (hs.sel + 10).min(n - 1) },
+            Key::Named(NamedKey::PageDown) => hs.sel = hs.sel.saturating_sub(10),
+            Key::Character(c) if ctrl && c.eq_ignore_ascii_case("r") => {
+                // toggle: all tabs <-> this tab
+                let (pane, all) = (hs.pane, !hs.all);
+                let items = self.history_items(pane, all);
+                let w = self.windows.get_mut(&wid).unwrap();
+                let hs = w.hist.as_mut().unwrap();
+                hs.all = all;
+                hs.items = items;
+                refilter(hs);
+            }
+            Key::Character(c) if ctrl && c.eq_ignore_ascii_case("u") => {
+                hs.query.clear();
+                refilter(hs);
+            }
+            Key::Named(NamedKey::Backspace) => {
+                hs.query.pop();
+                refilter(hs);
+            }
+            Key::Named(NamedKey::Enter) | Key::Named(NamedKey::Tab) => {
+                let cmd = hs.matches.get(hs.sel).map(|(i, _)| hs.items[*i].clone());
+                let pane = hs.pane;
+                w.hist = None;
+                if let Some(cmd) = cmd {
+                    if let Some(p) = self.panes.get(&pane) {
+                        // replace the current command line: end-of-line, kill to start, insert
+                        p.write(b"\x05\x15".to_vec());
+                    }
+                    self.paste_into(pane, &cmd);
+                }
+            }
+            Key::Named(NamedKey::Shift | NamedKey::Control | NamedKey::Alt | NamedKey::Super) => {}
+            _ => {
+                if let Some(t) = &ev.text {
+                    if !ctrl {
+                        hs.query.extend(t.chars().filter(|c| !c.is_control()));
+                        refilter(hs);
+                    }
+                }
+            }
+        }
+        if let Some(w) = self.windows.get(&wid) {
+            w.window.request_redraw();
+        }
+        true
+    }
+}
+
+fn refilter(hs: &mut HistSearch) {
+    let mut m: Vec<(i64, usize, Vec<usize>)> = hs
+        .items
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| fuzzy(&hs.query, c).map(|(s, p)| (s, i, p)))
+        .collect();
+    if !hs.query.is_empty() {
+        // best score first; recency (lower index) breaks ties
+        m.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    }
+    m.truncate(2000);
+    hs.matches = m.into_iter().map(|(_, i, p)| (i, p)).collect();
+    hs.sel = 0;
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn fuzzy_match() {
+        assert!(super::fuzzy("dckps", "docker ps -a").is_some());
+        assert!(super::fuzzy("xyz", "docker ps").is_none());
+        let a = super::fuzzy("git", "git status").unwrap().0;
+        let b = super::fuzzy("git", "go install thing").unwrap_or((0, vec![])).0;
+        assert!(a > b);
+    }
+}

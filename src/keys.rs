@@ -58,6 +58,7 @@ pub enum Action {
     PromptPrev,
     PromptNext,
     CopyLastOutput,
+    HistorySearch,
     None,
 }
 
@@ -127,6 +128,7 @@ impl Action {
             "scroll_to_prompt_up" | "previous_prompt" => Action::PromptPrev,
             "scroll_to_prompt_down" | "next_prompt" => Action::PromptNext,
             "copy_last_command_output" | "copy_last_output" => Action::CopyLastOutput,
+            "history_search" => Action::HistorySearch,
             "none" | "no_op" => Action::None,
             _ => return None,
         })
@@ -217,6 +219,7 @@ const DEFAULTS: &[(&str, &str)] = &[
     ("kitty_mod+z", "previous_prompt"),
     ("kitty_mod+x", "next_prompt"),
     ("kitty_mod+g", "copy_last_command_output"),
+    ("ctrl+r", "history_search"),
 ];
 
 /// Every bindable action with a short description (used by the settings page).
@@ -264,6 +267,7 @@ pub const ACTIONS: &[(&str, &str)] = &[
     ("previous_prompt", "Jump to previous prompt"),
     ("next_prompt", "Jump to next prompt"),
     ("copy_last_command_output", "Copy last command output"),
+    ("history_search", "History search (at a shell prompt)"),
     ("scroll_line_up", "Scroll line up"),
     ("scroll_line_down", "Scroll line down"),
     ("scroll_page_up", "Scroll page up"),

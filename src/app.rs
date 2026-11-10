@@ -1,6 +1,6 @@
 //! Application: OS windows, tabs, split panes, input, rendering, dropdown & session handling.
 mod extras;
-use extras::{hint_regexes, HintKind, Hints};
+use extras::{hint_regexes, HintKind, Hints, HistSearch};
 use crate::config::{Config, Rgb, Theme};
 use crate::font::{self, FontSet};
 use crate::keys::{self, Action, Bindings};
@@ -91,6 +91,7 @@ struct OsWin {
     bell_at: Option<Instant>,
     menu: Option<Menu>,
     hints: Option<Hints>,
+    hist: Option<HistSearch>,
     /// Dropdown: fullscreen state when it was last hidden (restored on show)
     was_fullscreen: bool,
     /// Moves caused by our own show/fullscreen requests are not "the user moved it"
@@ -422,6 +423,7 @@ impl App {
                 bell_at: None,
                 menu: None,
                 hints: None,
+                hist: None,
                 ignore_moves_until: None,
                 reapply_geometry_at: None,
                 refullscreen_at: None,
@@ -1537,6 +1539,7 @@ impl App {
             Action::QuitWithoutSaving => self.request_close(el, wid, Confirm::QuitNoSave),
             Action::OpenSettings => self.open_settings_tab(el, wid, None),
             Action::Hints => self.start_hints(wid),
+            Action::HistorySearch => self.open_history_search(wid),
             Action::PromptPrev => self.jump_prompt(wid, false),
             Action::PromptNext => self.jump_prompt(wid, true),
             Action::CopyLastOutput => self.copy_last_output(wid),
@@ -1656,6 +1659,9 @@ impl App {
         if self.windows.get(&wid).map(|w| w.hints.is_some()).unwrap_or(false) && self.hints_key(wid, &ev) {
             return;
         }
+        if self.windows.get(&wid).map(|w| w.hist.is_some()).unwrap_or(false) && self.history_key(wid, &ev) {
+            return;
+        }
         // Close confirmation prompt
         if let Some(c) = self.windows.get(&wid).and_then(|w| w.confirm) {
             if let Confirm::Exited(id) = c {
@@ -1751,8 +1757,12 @@ impl App {
             .unwrap_or(false);
         if !capturing {
             if let Some(a) = self.bindings.lookup(&ev, self.modifiers) {
-                self.do_action(el, wid, a);
-                return;
+                // Ctrl+R is ours only at a local shell prompt; vim/less/ssh… get the key
+                let pass = a == Action::HistorySearch && !self.active_pane_id(wid).map(|id| self.shell_idle(id)).unwrap_or(false);
+                if !pass {
+                    self.do_action(el, wid, a);
+                    return;
+                }
             }
         }
         let Some(id) = self.active_pane_id(wid) else { return };
@@ -2361,6 +2371,45 @@ impl App {
             win.renderer.rect_top(0.0, by, ww, bh, rgba(theme.tab_bar_bg, 1.0));
             let txt = format!("Hints {}▏  letter: open link / copy   Shift+letter: paste into terminal   Esc: cancel", h.typed.to_uppercase());
             win.renderer.text(gpu, fonts, &txt, m.width, by + 3.0, ww - m.width, rgba(theme.table[256], 1.0));
+        }
+
+        // Ctrl+R history search
+        if let Some(hs) = &win.hist {
+            let (_, wh) = win.renderer.size();
+            let rows = ((wh * 0.45 / m.height) as usize).clamp(5, 20);
+            let bh = (rows + 2) as f32 * m.height + 8.0;
+            let by = wh - bh;
+            let r = &mut win.renderer;
+            r.rect_top(0.0, by - 1.0, ww, 1.0, rgba(theme.active_border, 1.0));
+            r.rect_top(0.0, by, ww, bh, rgba(theme.tab_bar_bg, 1.0));
+            let scope = if hs.all { "all tabs" } else { "this tab" };
+            let head = format!(" History ({scope}) {}/{}   Enter: insert   Ctrl+R: {}   Esc: cancel",
+                hs.matches.len(), hs.items.len(), if hs.all { "this tab only" } else { "all tabs" });
+            r.text(gpu, fonts, &head, 0.0, by + 4.0, ww, rgba(theme.inactive_border, 1.0));
+            // list: best match at the bottom (closest to the prompt), like fzf
+            let list_bottom = wh - m.height - 4.0;
+            let start = hs.sel.saturating_sub(rows - 1);
+            for (k, (idx, pos)) in hs.matches.iter().enumerate().skip(start).take(rows) {
+                let y = list_bottom - ((k - start) + 1) as f32 * m.height;
+                let selected = k == hs.sel;
+                if selected {
+                    r.rect_top(0.0, y, ww, m.height, rgba(theme.sel_bg, 1.0));
+                }
+                let fg = if selected { theme.sel_fg } else { theme.table[256] };
+                let line: String = hs.items[*idx].replace('\n', " ⏎ ");
+                let x0 = 2.0 * m.width;
+                // highlight matched characters
+                for &p in pos {
+                    let x = x0 + p as f32 * m.width;
+                    if x + m.width < ww {
+                        r.rect_top(x, y + m.height - m.thickness * 2.0, m.width, m.thickness * 2.0, rgba(theme.search_match, 1.0));
+                    }
+                }
+                r.text(gpu, fonts, if selected { "▶" } else { " " }, 0.0, y, m.width * 2.0, rgba(fg, 1.0));
+                r.text(gpu, fonts, &line, x0, y, ww - x0, rgba(fg, 1.0));
+            }
+            let q = format!("> {}▏", hs.query);
+            r.text(gpu, fonts, &q, m.width, list_bottom, ww, rgba(theme.table[256], 1.0));
         }
 
         // Scrollbars
