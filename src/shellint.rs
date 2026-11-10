@@ -8,9 +8,53 @@ pub const FISH: &str = include_str!("shell/dtem.fish");
 pub const LAUNCHER: &str = include_str!("shell/dtem-shell");
 pub const ICAT: &str = include_str!("shell/dtem-icat");
 
-/// ble.sh (fish-like suggestions for bash) if installed.
+/// ble.sh (BSD-3-Clause, https://github.com/akinomyoga/ble.sh) bundled with dtem.
+static BLESH_TGZ: &[u8] = include_bytes!("../vendor/blesh.tar.gz");
+
+/// ble.sh for suggestions while typing: a user-installed one (~/.local/share/blesh) wins,
+/// otherwise the bundled copy is unpacked to ~/.local/share/dtem/blesh.
 pub fn blesh() -> Option<PathBuf> {
-    let p = dirs::data_dir()?.join("blesh/ble.sh");
+    let own = dirs::data_dir()?.join("blesh/ble.sh");
+    if own.is_file() {
+        return Some(own);
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    let dir = dirs::data_dir()?.join("dtem/blesh");
+    ONCE.call_once(|| {
+        let stamp = format!("{}", BLESH_TGZ.len());
+        let stamp_file = dir.join(".dtem-stamp");
+        if std::fs::read_to_string(&stamp_file).map(|s| s == stamp).unwrap_or(false) && dir.join("ble.sh").is_file() {
+            return;
+        }
+        let tmp = dir.with_extension("tmp");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let ok = (|| -> std::io::Result<()> {
+            std::fs::create_dir_all(&tmp)?;
+            let mut ar = tar::Archive::new(flate2::read::GzDecoder::new(BLESH_TGZ));
+            for entry in ar.entries()? {
+                let mut e = entry?;
+                let path = e.path()?.into_owned();
+                // strip the top-level "ble-nightly/" directory; refuse anything odd
+                let rel: PathBuf = path.components().skip(1).collect();
+                if rel.as_os_str().is_empty() || rel.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+                    continue;
+                }
+                let out = tmp.join(&rel);
+                if let Some(p) = out.parent() {
+                    std::fs::create_dir_all(p)?;
+                }
+                e.unpack(&out)?;
+            }
+            std::fs::write(tmp.join(".dtem-stamp"), &stamp)?;
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::rename(&tmp, &dir)?;
+            Ok(())
+        })();
+        if let Err(e) = ok {
+            log::warn!("cannot unpack bundled ble.sh: {e}");
+        }
+    });
+    let p = dir.join("ble.sh");
     p.is_file().then_some(p)
 }
 
