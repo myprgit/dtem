@@ -3,6 +3,7 @@ mod confedit;
 mod config;
 mod font;
 mod images;
+mod installer;
 mod keys;
 mod layout;
 mod pane;
@@ -50,6 +51,12 @@ USAGE:
   dtem --remote [ssh args] HOST ssh with clipboard/file sync (inside dtem: in the current pane)
   dtem --remote --new-tab HOST  ssh in a new tab of the running dtem
   dtem --no-restore             don't restore the previous session
+  dtem --install [--no-autostart] [--no-shortcut]
+                                install this binary for the current user (menu entry,
+                                dropdown autostart, GNOME hotkeys, shell integration)
+  dtem --uninstall [--purge]    remove it again (--purge: also config, sessions, history)
+  dtem --export-config [FILE]   pack config + saved layouts (+ ~/.blerc) into a .tar.gz
+  dtem --import-config FILE     restore them on another PC
   dtem --install-gnome-shortcut register the dropdown hotkey in GNOME (X11 + Wayland)
   dtem --quit [--dropdown] [--no-save]
                                 quit the running instance (--no-save: forget the session)
@@ -118,6 +125,38 @@ fn parse_args() -> Args {
             "--no-save" => a.no_save = true,
             "--settings" => a.settings = Some(None),
             s if s.starts_with("--settings=") => a.settings = Some(Some(s["--settings=".len()..].to_string())),
+            "--install" | "--uninstall" => {
+                let rest: Vec<String> = it.by_ref().collect();
+                let r = if arg == "--install" { installer::install(&rest) } else { installer::uninstall(&rest) };
+                if let Err(e) = r {
+                    eprintln!("dtem: {e}");
+                    std::process::exit(1);
+                }
+                std::process::exit(0);
+            }
+            "--export-config" => {
+                let file = it.next();
+                if let Err(e) = installer::export_config(file.as_deref()) {
+                    eprintln!("dtem: {e}");
+                    std::process::exit(1);
+                }
+                std::process::exit(0);
+            }
+            "--import-config" => {
+                let Some(file) = it.next() else {
+                    eprintln!("usage: dtem --import-config FILE.tar.gz");
+                    std::process::exit(2);
+                };
+                if let Err(e) = installer::import_config(&file) {
+                    eprintln!("dtem: {e}");
+                    std::process::exit(1);
+                }
+                std::process::exit(0);
+            }
+            "--version" | "-V" => {
+                println!("dtem {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             "--import-tilda" => {
                 let next = it.next();
                 if next.as_deref().map(|n| n.starts_with('-')).unwrap_or(false) {
@@ -271,6 +310,21 @@ fn accel_norm(a: &str) -> String {
 /// Other custom shortcuts using the same key are disabled (reported).
 pub fn install_gnome_shortcut(cfg: &config::Config, quiet: bool) -> anyhow::Result<()> {
     let exe = std::env::current_exe()?;
+    install_gnome_shortcut_for(cfg, &exe, quiet)
+}
+
+/// Remove dtem's GNOME custom shortcuts.
+pub fn remove_gnome_shortcuts() {
+    let mut paths = custom_paths();
+    let before = paths.len();
+    paths.retain(|p| !p.contains("/dtem-dropdown"));
+    if paths.len() != before {
+        let list = format!("[{}]", paths.iter().map(|p| format!("'{p}'")).collect::<Vec<_>>().join(", "));
+        gsettings(&["set", MEDIA_KEYS, "custom-keybindings", &list]);
+    }
+}
+
+pub fn install_gnome_shortcut_for(cfg: &config::Config, exe: &std::path::Path, quiet: bool) -> anyhow::Result<()> {
     let mut paths = custom_paths();
     // drop our previous entries
     paths.retain(|p| !p.contains("/dtem-dropdown"));
