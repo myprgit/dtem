@@ -25,7 +25,7 @@ impl OneOrMany {
 #[serde(default)]
 pub struct Config {
     // ---- font & look
-    /// fontconfig family or a font file path
+    /// fontconfig family, a font file path, or "builtin" (JetBrains Mono, always available)
     pub font_family: String,
     pub font_size: f32,
     pub line_height: f32,
@@ -247,7 +247,7 @@ pub struct Colors {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            font_family: "monospace".into(),
+            font_family: "JetBrains Mono".into(),
             font_size: 11.0,
             line_height: 1.0,
             padding: 4.0,

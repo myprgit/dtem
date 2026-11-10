@@ -3,7 +3,7 @@
 # (kitty_mod+F2 or ctrl+, inside dtem, or `dtem --settings`). Import tilda: `dtem --import-tilda`.
 
 # ---- look
-font_family = "monospace"        # fontconfig name or a font file path
+font_family = "JetBrains Mono"   # fontconfig name, font file path, or "builtin" (built-in JetBrains Mono)
 font_size = 11.0
 line_height = 1.0
 padding = 4.0

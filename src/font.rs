@@ -30,7 +30,46 @@ pub struct Face {
     pub color: bool,
 }
 
+/// JetBrains Mono (SIL OFL 1.1, see assets/fonts/JetBrainsMono-OFL.txt), built in so dtem
+/// looks the same on any machine, even without fontconfig.
+pub const BUILTIN_NAME: &str = "JetBrains Mono";
+static BUILTIN: [&[u8]; 4] = [
+    include_bytes!("../assets/fonts/JetBrainsMono-Regular.ttf"),
+    include_bytes!("../assets/fonts/JetBrainsMono-Bold.ttf"),
+    include_bytes!("../assets/fonts/JetBrainsMono-Italic.ttf"),
+    include_bytes!("../assets/fonts/JetBrainsMono-BoldItalic.ttf"),
+];
+
+/// Family name fontconfig resolves a pattern to (None if fontconfig isn't available).
+fn fc_family(pattern: &str) -> Option<String> {
+    let out = Command::new("fc-match").args(["-f", "%{family}", pattern]).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Use the built-in font for this family? (explicitly, or JetBrains Mono not installed,
+/// or no fontconfig at all)
+fn use_builtin(family: &str) -> bool {
+    let f = family.trim().to_lowercase();
+    if f == "builtin" || f == "built-in" {
+        return true;
+    }
+    if std::path::Path::new(family).is_file() {
+        return false;
+    }
+    match fc_family(family) {
+        None => true, // no fontconfig
+        Some(found) => f == BUILTIN_NAME.to_lowercase() && !found.to_lowercase().contains(&f),
+    }
+}
+
 impl Face {
+    fn from_bytes(bytes: &[u8], color: bool) -> Option<Face> {
+        let data = Arc::new(bytes.to_vec());
+        let f = FontRef::from_index(&data, 0)?;
+        let (offset, key) = (f.offset, f.key);
+        Some(Face { data, offset, key, color })
+    }
+
     fn load(path: &str, index: u32) -> Option<Face> {
         let data = Arc::new(std::fs::read(path).ok()?);
         let f = FontRef::from_index(&data, index as usize)?;
@@ -73,10 +112,24 @@ fn load_family(family: &str, suffix: &str) -> Option<Face> {
 
 impl FontSet {
     pub fn new(family: &str) -> anyhow::Result<FontSet> {
+        if use_builtin(family) {
+            let faces: Vec<Face> = BUILTIN.iter().filter_map(|b| Face::from_bytes(b, false)).collect();
+            anyhow::ensure!(faces.len() == 4, "built-in font is corrupt");
+            return Ok(FontSet {
+                faces,
+                styles: [0, 1, 2, 3],
+                family: "monospace".to_string(),
+                fallback_paths: HashMap::new(),
+                char_fallback: HashMap::new(),
+                shape_ctx: ShapeContext::new(),
+                shape_cache: HashMap::new(),
+            });
+        }
         let regular = load_family(family, ":style=Regular")
             .or_else(|| load_family(family, ""))
             .or_else(|| fc_match("monospace").and_then(|(f, i)| Face::load(&f, i)))
-            .ok_or_else(|| anyhow::anyhow!("no usable font found (is fontconfig installed?)"))?;
+            .or_else(|| Face::from_bytes(BUILTIN[0], false))
+            .ok_or_else(|| anyhow::anyhow!("no usable font found"))?;
         let mut faces = vec![regular];
         let mut styles = [0usize; 4];
         for (slot, suffix) in [(1usize, ":weight=bold"), (2, ":slant=italic"), (3, ":weight=bold:slant=italic")] {
