@@ -47,15 +47,23 @@ impl App {
     fn tab_label(&mut self, pane: u64) -> String {
         let Some(wid) = self.pane_win.get(&pane).copied() else { return "dtem".into() };
         let Some(w) = self.windows.get(&wid) else { return "dtem".into() };
-        let Some((i, t)) = w.tabs.iter().enumerate().find(|(_, t)| t.root.leaf_list().contains(&pane)) else {
+        let Some(loc) = w.find_pane(pane) else {
             return "dtem".into();
+        };
+        let i = loc.tab;
+        let t = &w.ws_tabs(loc.ws)[i];
+        let ws = if w.ws_visible() {
+            let name = if loc.ws == w.ws_cur { w.ws_name().to_string() } else { w.workspaces[loc.ws].name.clone() };
+            format!("{name} › ")
+        } else {
+            String::new()
         };
         let title = t.title.clone();
         let base = match title {
             Some(s) => s,
             None => self.panes.get_mut(&pane).map(|p| p.display_title()).unwrap_or_default(),
         };
-        format!("Tab {}: {base}", i + 1)
+        format!("{ws}Tab {}: {base}", i + 1)
     }
 
     /// Desktop notification; clicking it focuses the pane.
@@ -142,10 +150,10 @@ impl App {
 
     pub(super) fn focus_pane_global(&mut self, el: &ActiveEventLoop, pane: u64) {
         let Some(wid) = self.pane_win.get(&pane).copied() else { return };
-        let Some(w) = self.windows.get_mut(&wid) else { return };
-        if let Some(i) = w.tabs.iter().position(|t| t.root.leaf_list().contains(&pane)) {
-            w.active_tab = i;
+        if !self.windows.contains_key(&wid) {
+            return;
         }
+        self.reveal_pane(wid, pane);
         self.focus_pane(wid, pane);
         self.relayout(wid);
         let w = &self.windows[&wid];
@@ -416,11 +424,7 @@ impl App {
             p.exit_code = code;
         }
         // show the pane that exited
-        if let Some(w) = self.windows.get_mut(&wid) {
-            if let Some(i) = w.tabs.iter().position(|t| t.root.leaf_list().contains(&id)) {
-                w.active_tab = i;
-            }
-        }
+        self.reveal_pane(wid, id);
         self.focus_pane(wid, id);
         self.relayout(wid);
         let w = self.windows.get_mut(&wid).unwrap();
@@ -435,7 +439,7 @@ impl App {
         let rect = self.windows[&wid].pane_rects.iter().find(|(i, _)| *i == id).map(|x| x.1).unwrap_or_default();
         let new = self.alloc_id();
         if let Some(w) = self.windows.get_mut(&wid) {
-            for t in w.tabs.iter_mut() {
+            for t in w.all_tabs_mut() {
                 t.root.swap(id, new);
                 if t.active == id {
                     t.active = new;

@@ -67,7 +67,36 @@ pub struct WinState {
     pub font_size: Option<f32>,
     #[serde(default)]
     pub active_tab: usize,
+    /// Tabs of the window. With workspaces this is the flattened list of all of them
+    /// (so older dtem versions still restore every tab); `workspaces` wins when present.
     pub tabs: Vec<TabState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspaces: Vec<WorkspaceState>,
+    #[serde(default)]
+    pub active_workspace: usize,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct WorkspaceState {
+    pub name: String,
+    #[serde(default)]
+    pub active_tab: usize,
+    pub tabs: Vec<TabState>,
+}
+
+impl WinState {
+    /// (name, active tab, tabs) per workspace; one unnamed workspace for old sessions.
+    pub fn workspace_list(&self) -> Vec<(Option<String>, usize, Vec<TabState>)> {
+        if self.workspaces.is_empty() {
+            vec![(None, self.active_tab, self.tabs.clone())]
+        } else {
+            self.workspaces.iter().map(|w| (Some(w.name.clone()), w.active_tab, w.tabs.clone())).collect()
+        }
+    }
+
+    pub fn has_tabs(&self) -> bool {
+        !self.tabs.is_empty() || self.workspaces.iter().any(|w| !w.tabs.is_empty())
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -160,9 +189,54 @@ pub fn to_layout_file(s: &Session) -> Session {
     }
     let mut s = s.clone();
     for w in &mut s.windows {
-        for t in &mut w.tabs {
+        for t in w.tabs.iter_mut().chain(w.workspaces.iter_mut().flat_map(|ws| ws.tabs.iter_mut())) {
             t.layout = strip(&t.layout);
         }
     }
     s
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_session_is_one_unnamed_workspace() {
+        let old = r#"{"version":1,"windows":[{"active_tab":1,"tabs":[
+            {"layout":{"Leaf":{"cwd":"/tmp"}}},{"title":"b","layout":{"Leaf":{"cwd":"/"}}}]}]}"#;
+        let s: Session = serde_json::from_str(old).unwrap();
+        let w = &s.windows[0];
+        assert!(w.has_tabs());
+        let l = w.workspace_list();
+        assert_eq!(l.len(), 1);
+        assert_eq!(l[0].0, None);
+        assert_eq!(l[0].1, 1);
+        assert_eq!(l[0].2.len(), 2);
+    }
+
+    #[test]
+    fn workspaces_round_trip() {
+        let tab = |t: &str| TabState {
+            title: Some(t.into()),
+            active: 0,
+            layout: SNode::Leaf { cwd: None, command: None, scrollback: None, title: None, remote: None, remote_cwd: None },
+        };
+        let w = WinState {
+            tabs: vec![tab("a"), tab("b")],
+            workspaces: vec![
+                WorkspaceState { name: "Work".into(), active_tab: 0, tabs: vec![tab("a")] },
+                WorkspaceState { name: "Home".into(), active_tab: 0, tabs: vec![tab("b")] },
+            ],
+            active_workspace: 1,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&Session { version: 1, windows: vec![w] }).unwrap();
+        let s: Session = serde_json::from_str(&json).unwrap();
+        let l = s.windows[0].workspace_list();
+        assert_eq!(l.iter().map(|x| x.0.clone().unwrap()).collect::<Vec<_>>(), vec!["Work", "Home"]);
+        assert_eq!(s.windows[0].active_workspace, 1);
+        // older versions read the flattened list
+        assert_eq!(s.windows[0].tabs.len(), 2);
+    }
+}
+

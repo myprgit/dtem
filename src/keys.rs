@@ -61,6 +61,12 @@ pub enum Action {
     HistorySearch,
     StashTab,
     StashedTabs,
+    NextWorkspace,
+    PreviousWorkspace,
+    NewWorkspace,
+    RenameWorkspace,
+    Workspaces,
+    GotoWorkspace(usize),
     None,
 }
 
@@ -74,6 +80,9 @@ impl Action {
         }
         if let Some(n) = num("nth_window_") {
             return Some(Action::NthWindow(n));
+        }
+        if let Some(n) = num("goto_workspace_") {
+            return Some(Action::GotoWorkspace(n));
         }
         Some(match s {
             "new_tab" => Action::NewTab,
@@ -133,6 +142,11 @@ impl Action {
             "history_search" => Action::HistorySearch,
             "stash_tab" => Action::StashTab,
             "stashed_tabs" | "stash_browser" => Action::StashedTabs,
+            "next_workspace" => Action::NextWorkspace,
+            "previous_workspace" => Action::PreviousWorkspace,
+            "new_workspace" => Action::NewWorkspace,
+            "rename_workspace" => Action::RenameWorkspace,
+            "workspaces" | "workspace_menu" => Action::Workspaces,
             "none" | "no_op" => Action::None,
             _ => return None,
         })
@@ -153,6 +167,10 @@ const DEFAULTS: &[(&str, &str)] = &[
     ("kitty_mod+alt+t", "set_tab_title"),
     ("kitty_mod+d", "stash_tab"),
     ("kitty_mod+o", "stashed_tabs"),
+    // workspaces (groups of tabs)
+    ("kitty_mod+a", "workspaces"),
+    ("ctrl+page_down", "next_workspace"),
+    ("ctrl+page_up", "previous_workspace"),
     ("alt+1", "goto_tab_1"),
     ("alt+2", "goto_tab_2"),
     ("alt+3", "goto_tab_3"),
@@ -240,6 +258,11 @@ pub const ACTIONS: &[(&str, &str)] = &[
     ("set_tab_title", "Rename tab"),
     ("stash_tab", "Stash tab"),
     ("stashed_tabs", "Stashed tabs"),
+    ("workspaces", "Workspaces menu"),
+    ("next_workspace", "Next workspace"),
+    ("previous_workspace", "Previous workspace"),
+    ("new_workspace", "New workspace"),
+    ("rename_workspace", "Rename workspace"),
     ("goto_tab_1", "Go to tab 1"),
     ("goto_tab_2", "Go to tab 2"),
     ("goto_tab_3", "Go to tab 3"),

@@ -6,6 +6,7 @@
 
 - **Fast:** renders through wgpu (Vulkan/GL) on top of `alacritty_terminal`.
 - **Tabs and split panes:** a kitty-style split tree. Drag tabs to reorder them.
+- **Workspaces:** named groups of tabs ("Work", "Personal", …) in one window.
 - **Tab stash:** put tabs away and bring them back later. Their output stays browsable in the meantime.
 - **Session persistence:** windows, tabs, splits, cwd and scrollback are restored, even after a reboot.
 - **Dropdown mode:** tilda/guake-style, remembers its monitor, and can import your tilda config.
@@ -30,6 +31,19 @@ Tabs you aren't looking at get a marker:
 Long-running commands that finish in the background send a desktop notification. Click it to jump to the tab.
 
 To rename a tab, **double-click** it, press `kitty_mod+r`, or right-click → Rename Tab….
+
+### Workspaces
+
+A workspace is a named group of tabs, such as "Work", "Personal" or "Servers". The tab bar shows only the current workspace's tabs, and a button at its start shows the workspace's name.
+
+- **Open the workspace menu:** click that button or press `kitty_mod+a`. From the menu you can switch, create, rename or close workspaces.
+- **Cycle workspaces:** `ctrl+page_down` / `ctrl+page_up`. While there is only one workspace, these keys still go to the running program.
+- **Move a tab:** right-click it → Move Tab to “…” / Move Tab to New Workspace.
+- **Activity in other workspaces:** a bell, a failed command or new output there puts a marker on the workspace button. Clicking a notification jumps to the right workspace and tab.
+- **Persistence:** workspaces are saved with the session. A layout file can define them too (see below). Older dtem versions still restore every tab, just without the grouping.
+- **Removal:** closing the last tab of a workspace removes that workspace.
+
+![Workspace menu with three workspaces](docs/screenshots/workspaces.png)
 
 ### Stash tabs
 
@@ -103,7 +117,7 @@ Text rendering supports programming **ligatures** (swash shaping) and **color em
 
 ### Right-click menu
 
-Right-clicking a terminal or the tab bar opens a menu with New Tab, Rename Tab…, Close Tab, Stash Tab, Stashed Tabs…, Copy, Paste, Open/Copy Link, splits, fullscreen, transparency, search, Preferences…, Keyboard Shortcuts… and Quit. Each item shows its current shortcut. If a program uses the mouse (vim, htop), open the menu with **Shift+right-click**.
+Right-clicking a terminal or the tab bar opens a menu with New Tab, Rename Tab…, Close Tab, Stash Tab, Stashed Tabs…, Move Tab to …, Copy, Paste, Open/Copy Link, splits, fullscreen, transparency, search, Preferences…, Keyboard Shortcuts… and Quit. Each item shows its current shortcut. If a program uses the mouse (vim, htop), open the menu with **Shift+right-click**.
 
 ![Right-click menu on a link](docs/screenshots/menu.png)
 
@@ -144,9 +158,9 @@ Download the binary or the .deb from the [Releases page](https://github.com/mypr
 
 ```bash
 # single binary
-chmod +x dtem-0.2.0-x86_64 && ./dtem-0.2.0-x86_64 --install
+chmod +x dtem-0.3.0-x86_64 && ./dtem-0.3.0-x86_64 --install
 # or the Debian/Ubuntu package
-sudo apt install ./dtem_0.2.0-1_amd64.deb && dtem --install
+sudo apt install ./dtem_0.3.0-1_amd64.deb && dtem --install
 ```
 
 `dtem --install` sets up the following for the current user:
@@ -288,6 +302,9 @@ Typed inside a dtem terminal, it runs ssh **right in that pane** (like `kitten s
 | move tab | `kitty_mod+.` / `kitty_mod+,`, or drag it in the tab bar |
 | rename tab | `kitty_mod+r`, `kitty_mod+alt+t`, or double-click the tab |
 | stash tab / stashed tabs | `kitty_mod+d` / `kitty_mod+o` |
+| workspace menu | `kitty_mod+a` |
+| next / previous workspace | `ctrl+page_down` / `ctrl+page_up` |
+| new / rename workspace | `new_workspace` / `rename_workspace` (unbound; also in the workspace menu) |
 | new split (along the longer side) | `kitty_mod+enter` |
 | hsplit / vsplit / rotate split | `F5` / `F6` / `F7` |
 | close pane | `kitty_mod+w` |
@@ -324,6 +341,15 @@ These are plain JSON, in the same format as the autosave. Example:
     "a":{"Leaf":{"cwd":"~/proj/api","command":"nvim ."}},
     "b":{"Leaf":{"cwd":"~/proj/api","command":"ssh devbox"}}}}},
   {"title":"logs","layout":{"Leaf":{"cwd":"/var/log"}}}
+]}]}
+```
+
+With workspaces, list them under `workspaces` instead of `tabs`:
+
+```json
+{"windows":[{"tabs":[],"active_workspace":0,"workspaces":[
+  {"name":"Work","tabs":[{"title":"api","layout":{"Leaf":{"cwd":"~/proj/api"}}}]},
+  {"name":"Personal","tabs":[{"layout":{"Leaf":{"cwd":"~/dotfiles"}}}]}
 ]}]}
 ```
 

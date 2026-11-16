@@ -1,6 +1,8 @@
 //! Application: OS windows, tabs, split panes, input, rendering, dropdown & session handling.
 mod extras;
 mod stash;
+mod workspace;
+use workspace::Workspace;
 use extras::{hint_regexes, HintKind, Hints, HistSearch};
 use crate::config::{Config, Rgb, Theme};
 use crate::font::{self, FontSet};
@@ -60,6 +62,8 @@ enum Confirm {
     Exited(u64),
     /// Stash a tab in which a program is running (it will end)
     Stash(usize),
+    /// Close workspace i with all its tabs
+    Workspace(usize),
 }
 
 struct Tab {
@@ -99,6 +103,13 @@ struct OsWin {
     stash: Option<stash::StashView>,
     /// Stash button at the end of the tab bar
     stash_btn: Option<Rect>,
+    /// All workspaces; the current one's tabs are `tabs` (see workspace.rs)
+    workspaces: Vec<Workspace>,
+    ws_cur: usize,
+    /// Workspace button at the start of the tab bar
+    ws_btn: Option<Rect>,
+    /// The rename prompt edits the workspace name instead of the tab title
+    rename_ws: bool,
     bell_at: Option<Instant>,
     menu: Option<Menu>,
     hints: Option<Hints>,
@@ -440,6 +451,10 @@ impl App {
                 tab_last_click: None,
                 stash: None,
                 stash_btn: None,
+                workspaces: vec![Workspace::new(workspace::DEFAULT_NAME)],
+                ws_cur: 0,
+                ws_btn: None,
+                rename_ws: false,
                 bell_at: None,
                 menu: None,
                 hints: None,
@@ -470,7 +485,7 @@ impl App {
     }
 
     fn tab_bar_height(&self, win: &OsWin) -> f32 {
-        if self.cfg.tab_bar_position != "hidden" && win.tabs.len() >= self.cfg.tab_bar_min_tabs.max(1) {
+        if self.cfg.tab_bar_position != "hidden" && (win.tabs.len() >= self.cfg.tab_bar_min_tabs.max(1) || win.ws_visible()) {
             (win.renderer.metrics.height + 6.0 * win.scale as f32).round()
         } else {
             0.0
@@ -673,7 +688,39 @@ impl App {
     /// Remove a pane id from its tab's tree (does not touch the process).
     fn remove_leaf(&mut self, wid: WindowId, id: u64) {
         let Some(win) = self.windows.get_mut(&wid) else { return };
-        let Some(ti) = win.tabs.iter().position(|t| t.root.leaf_list().contains(&id)) else { return };
+        let Some(loc) = win.find_pane(id) else { return };
+        if loc.ws != win.ws_cur {
+            // a pane in a workspace you aren't looking at (e.g. its shell exited)
+            let ws = &mut win.workspaces[loc.ws];
+            let tab = &mut ws.tabs[loc.tab];
+            let root = std::mem::replace(&mut tab.root, Node::Leaf(0));
+            match root.remove(id) {
+                Some(r) => {
+                    tab.root = r;
+                    if tab.active == id {
+                        tab.active = tab.root.leaf_list()[0];
+                        tab.zoomed = false;
+                    }
+                }
+                None => {
+                    ws.tabs.remove(loc.tab);
+                    if loc.tab < ws.active_tab {
+                        ws.active_tab -= 1;
+                    }
+                    if ws.active_tab >= ws.tabs.len() {
+                        ws.active_tab = ws.tabs.len().saturating_sub(1);
+                    }
+                    if ws.tabs.is_empty() {
+                        win.workspaces.remove(loc.ws);
+                        if win.ws_cur > loc.ws {
+                            win.ws_cur -= 1;
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        let ti = loc.tab;
         let tab = &mut win.tabs[ti];
         let leaves = tab.root.leaf_list();
         let root = std::mem::replace(&mut tab.root, Node::Leaf(0));
@@ -708,6 +755,12 @@ impl App {
     }
 
     fn after_structure_change(&mut self, el: &ActiveEventLoop, wid: WindowId) {
+        // last tab of a workspace closed while other workspaces exist: show another one
+        if self.windows.get(&wid).map(|w| w.tabs.is_empty()).unwrap_or(false) && self.drop_empty_current_workspace(wid, None) {
+            self.relayout(wid);
+            self.mark_save_soon();
+            return;
+        }
         let Some(win) = self.windows.get(&wid) else { return };
         if win.tabs.is_empty() {
             if win.dropdown {
@@ -753,7 +806,7 @@ impl App {
 
     fn destroy_window(&mut self, el: &ActiveEventLoop, wid: WindowId) {
         if let Some(win) = self.windows.remove(&wid) {
-            for t in &win.tabs {
+            for t in win.all_tabs() {
                 for id in t.root.leaf_list() {
                     self.pane_win.remove(&id);
                     if let Some(p) = self.panes.remove(&id) {
@@ -787,7 +840,7 @@ impl App {
             Confirm::Tab(_) => cc.tab,
             Confirm::Pane(_) => cc.pane,
             Confirm::Window | Confirm::Quit | Confirm::QuitNoSave => cc.window,
-            Confirm::ClipRead(_) | Confirm::Exited(_) | Confirm::Stash(_) => true,
+            Confirm::ClipRead(_) | Confirm::Exited(_) | Confirm::Stash(_) | Confirm::Workspace(_) => true,
         };
         if !ask {
             self.execute_close(el, wid, c);
@@ -804,6 +857,7 @@ impl App {
         match c {
             Confirm::Tab(i) => self.close_tab(el, wid, i),
             Confirm::Stash(i) => self.stash_tab(el, wid, i),
+            Confirm::Workspace(i) => self.close_workspace(el, wid, i),
             Confirm::Pane(id) => self.close_pane(el, id),
             Confirm::ClipRead(id) => {
                 if let Some(f) = self.pending_clip.remove(&wid) {
@@ -856,7 +910,7 @@ impl App {
 
     fn confirm_text(&self, wid: WindowId, c: Confirm) -> String {
         let win = &self.windows[&wid];
-        let tabs_all: usize = self.windows.values().map(|w| w.tabs.len()).sum();
+        let tabs_all: usize = self.windows.values().map(|w| w.all_tabs().count()).sum();
         match c {
             Confirm::Quit => format!("Quit dtem? ({tabs_all} tabs — restored on next start)"),
             Confirm::QuitNoSave => "Quit and FORGET the session? (next start is empty)".to_string(),
@@ -876,6 +930,11 @@ impl App {
                 }
             }
             Confirm::Pane(_) => "Close this pane?".to_string(),
+            Confirm::Workspace(i) => {
+                let name = if i == win.ws_cur { win.ws_name().to_string() } else { win.workspaces.get(i).map(|w| w.name.clone()).unwrap_or_default() };
+                let n = win.ws_tabs(i).len();
+                format!("Close workspace “{name}” and its {n} tab{}?", if n == 1 { "" } else { "s" })
+            }
             Confirm::Stash(i) => {
                 let progs: Vec<String> = win
                     .tabs
@@ -895,8 +954,8 @@ impl App {
                 format!("{who} wants to read your clipboard.")
             }
             Confirm::Window => {
-                let tabs = win.tabs.len();
-                let panes: usize = win.tabs.iter().map(|t| t.root.leaf_list().len()).sum();
+                let tabs = win.all_tabs().count();
+                let panes: usize = win.all_tabs().map(|t| t.root.leaf_list().len()).sum();
                 let last = self.windows.values().filter(|w| !w.dropdown).count() == 1;
                 if last {
                     format!("Quit dtem? ({tabs} tabs, {panes} panes — restored on next start)")
@@ -1124,17 +1183,34 @@ impl App {
         let order = self.order.clone();
         for wid in order {
             let Some(win) = self.windows.get(&wid) else { continue };
-            let mut tabs = Vec::new();
-            let tab_info: Vec<(Node, u64, Option<String>)> =
-                win.tabs.iter().map(|t| (t.root.clone(), t.active, t.title.clone())).collect();
-            for (root, active, title) in tab_info {
-                let leaves = root.leaf_list();
-                if leaves.iter().all(|id| self.panes.get(id).map(|p| p.settings).unwrap_or(false)) {
-                    continue; // settings page tabs aren't part of the session
+            let with_ws = workspace::snapshot_needed(win);
+            // (name, active tab, tabs) per workspace
+            let ws_info: Vec<(String, usize, Vec<(Node, u64, Option<String>)>)> = (0..win.workspaces.len())
+                .map(|i| {
+                    let name = if i == win.ws_cur { win.ws_name().to_string() } else { win.workspaces[i].name.clone() };
+                    let active = if i == win.ws_cur { win.active_tab } else { win.workspaces[i].active_tab };
+                    (name, active, win.ws_tabs(i).iter().map(|t| (t.root.clone(), t.active, t.title.clone())).collect())
+                })
+                .collect();
+            let ws_cur = win.ws_cur;
+            let mut workspaces = Vec::new();
+            for (name, active_tab, tab_info) in ws_info {
+                let mut tabs = Vec::new();
+                for (root, active, title) in tab_info {
+                    let leaves = root.leaf_list();
+                    if leaves.iter().all(|id| self.panes.get(id).map(|p| p.settings).unwrap_or(false)) {
+                        continue; // settings page tabs aren't part of the session
+                    }
+                    let layout = self.snode(&root);
+                    tabs.push(TabState { title, active: leaves.iter().position(|x| *x == active).unwrap_or(0), layout });
                 }
-                let layout = self.snode(&root);
-                tabs.push(TabState { title, active: leaves.iter().position(|x| *x == active).unwrap_or(0), layout });
+                workspaces.push(session::WorkspaceState { name, active_tab: active_tab.min(tabs.len().saturating_sub(1)), tabs });
             }
+            // flattened list for older versions (and for the single-workspace format)
+            let offset: usize = workspaces.iter().take(ws_cur).map(|w| w.tabs.len()).sum();
+            let flat_active = offset + workspaces.get(ws_cur).map(|w| w.active_tab).unwrap_or(0);
+            let tabs: Vec<TabState> = workspaces.iter().flat_map(|w| w.tabs.clone()).collect();
+            let (workspaces, active_workspace) = if with_ws { (workspaces, ws_cur) } else { (Vec::new(), 0) };
             let win = &self.windows[&wid];
             let pos = win.window.outer_position().ok().map(|p| (p.x, p.y)).or(win.pos);
             let size = win.window.inner_size();
@@ -1153,8 +1229,10 @@ impl App {
                 fullscreen: if win.dropdown && !win.visible { win.was_fullscreen } else { win.window.fullscreen().is_some() },
                 monitor,
                 font_size: Some(win.font_size),
-                active_tab: win.active_tab,
+                active_tab: flat_active,
                 tabs,
+                workspaces,
+                active_workspace,
             });
         }
         Session { version: 1, windows }
@@ -1262,7 +1340,7 @@ impl App {
 
     fn open_session(&mut self, el: &ActiveEventLoop, s: &Session, restore: bool) {
         for ws in &s.windows {
-            if ws.tabs.is_empty() {
+            if !ws.has_tabs() {
                 continue;
             }
             let wid = if self.role == Role::Dropdown {
@@ -1284,14 +1362,9 @@ impl App {
                     None => continue,
                 }
             };
-            for ts in &ws.tabs {
-                self.add_tab_from_state(wid, ts, restore, None);
-            }
-            if let Some(win) = self.windows.get_mut(&wid) {
-                if win.tabs.is_empty() {
-                    continue;
-                }
-                win.active_tab = ws.active_tab.min(win.tabs.len() - 1);
+            self.restore_workspaces(wid, ws, restore);
+            if self.windows.get(&wid).map(|w| w.tabs.is_empty()).unwrap_or(true) {
+                continue;
             }
             self.relayout(wid);
         }
@@ -1401,6 +1474,7 @@ impl App {
                 let win = self.windows.get_mut(&wid).unwrap();
                 let cur = win.tabs.get(win.active_tab).and_then(|t| t.title.clone()).unwrap_or_default();
                 win.rename = Some(cur);
+                win.rename_ws = false;
                 win.window.request_redraw();
             }
             Action::NewWindow => self.split(wid, None),
@@ -1594,6 +1668,22 @@ impl App {
                 }
             }
             Action::StashedTabs => self.open_stash_view(wid),
+            Action::NextWorkspace => self.cycle_workspace(wid, true),
+            Action::PreviousWorkspace => self.cycle_workspace(wid, false),
+            Action::NewWorkspace => self.new_workspace(wid),
+            Action::RenameWorkspace => self.rename_workspace(wid),
+            Action::Workspaces => {
+                let (x, y) = match self.windows.get(&wid).and_then(|w| w.ws_btn) {
+                    Some(r) => self.ws_menu_anchor(r),
+                    None => (0.0, self.windows.get(&wid).map(|w| self.tab_bar_height(w)).unwrap_or(0.0)),
+                };
+                self.open_workspace_menu(wid, x, y);
+            }
+            Action::GotoWorkspace(i) => {
+                if i >= 1 {
+                    self.switch_workspace(wid, i - 1);
+                }
+            }
             Action::PromptPrev => self.jump_prompt(wid, false),
             Action::PromptNext => self.jump_prompt(wid, true),
             Action::CopyLastOutput => self.copy_last_output(wid),
@@ -1784,12 +1874,22 @@ impl App {
                     let title = buf.trim().to_string();
                     let win = self.windows.get_mut(&wid).unwrap();
                     win.rename = None;
-                    if let Some(t) = win.tabs.get_mut(win.active_tab) {
+                    if std::mem::take(&mut win.rename_ws) {
+                        if !title.is_empty() {
+                            let c = win.ws_cur;
+                            win.workspaces[c].name = title;
+                        }
+                    } else if let Some(t) = win.tabs.get_mut(win.active_tab) {
                         t.title = if title.is_empty() { None } else { Some(title) };
                     }
+                    self.relayout(wid);
                     self.mark_save_soon();
                 }
-                Key::Named(NamedKey::Escape) => self.windows.get_mut(&wid).unwrap().rename = None,
+                Key::Named(NamedKey::Escape) => {
+                    let w = self.windows.get_mut(&wid).unwrap();
+                    w.rename = None;
+                    w.rename_ws = false;
+                }
                 Key::Named(NamedKey::Backspace) => {
                     buf.pop();
                 }
@@ -1815,7 +1915,10 @@ impl App {
         if !capturing {
             if let Some(a) = self.bindings.lookup(&ev, self.modifiers) {
                 // Ctrl+R is ours only at a local shell prompt; vim/less/ssh… get the key
-                let pass = a == Action::HistorySearch && !self.active_pane_id(wid).map(|id| self.shell_idle(id)).unwrap_or(false);
+                let pass = (a == Action::HistorySearch && !self.active_pane_id(wid).map(|id| self.shell_idle(id)).unwrap_or(false))
+                    // workspace cycling keys (ctrl+page_up/down) belong to the program until there are workspaces
+                    || (matches!(a, Action::NextWorkspace | Action::PreviousWorkspace)
+                        && self.windows.get(&wid).map(|w| w.workspaces.len() < 2).unwrap_or(true));
                 if !pass {
                     self.do_action(el, wid, a);
                     return;
@@ -1902,10 +2005,15 @@ impl App {
             }
             return;
         }
-        // Stash button at the end of the tab bar
-        if pressed && button == MouseButton::Left {
+        // Stash button at the end of the tab bar, workspace button at its start
+        if pressed && matches!(button, MouseButton::Left | MouseButton::Right) {
             if self.windows[&wid].stash_btn.map(|r| r.contains(x as f32, y as f32)).unwrap_or(false) {
                 self.open_stash_view(wid);
+                return;
+            }
+            if let Some(r) = self.windows[&wid].ws_btn.filter(|r| r.contains(x as f32, y as f32)) {
+                let (mx, my) = self.ws_menu_anchor(r);
+                self.open_workspace_menu(wid, mx, my);
                 return;
             }
         }
@@ -2243,6 +2351,15 @@ impl App {
         let tab_bar_h = self.windows.get(&wid).map(|w| self.tab_bar_height(w)).unwrap_or(0.0);
         let tb_h_pre = tab_bar_h;
         let stash_count = self.stash_count;
+        // workspace button: "Work ▾" (+ marker of activity in the other workspaces)
+        let ws_chip: Option<String> = self.windows.get(&wid).filter(|w| w.ws_visible()).map(|w| {
+            let mark = self.ws_others_marker(w);
+            match (&w.rename, w.rename_ws) {
+                (Some(buf), true) => format!("✎ {buf}▏"),
+                _ => format!("{} ▾{}", w.ws_name(), if mark.is_empty() { String::new() } else { format!(" {}", mark.trim_end()) }),
+            }
+        });
+        let ws_title = self.windows.get(&wid).filter(|w| w.ws_visible()).map(|w| w.ws_name().to_string());
         let confirm_text = self.windows.get(&wid).and_then(|w| w.confirm).map(|c| {
             let hint = if matches!(c, Confirm::ClipRead(_)) {
                 "[y] allow once   [a] always   [n] deny"
@@ -2676,7 +2793,7 @@ impl App {
                     })
                     .unwrap_or_default(),
             };
-            let base = if win.rename.is_some() && i == active_tab {
+            let base = if win.rename.is_some() && !win.rename_ws && i == active_tab {
                 format!("✎ {}▏", win.rename.as_ref().unwrap())
             } else {
                 base
@@ -2688,8 +2805,18 @@ impl App {
             titles.push(format!("{}: {mark}{}{}{}", i + 1, base, count, z));
         }
         win.stash_btn = None;
+        win.ws_btn = None;
+        let mut tabs_x = 0.0;
         if tb_h > 0.0 {
             win.renderer.rect(0.0, bar_y, ww, tb_h, rgba(theme.tab_bar_bg, 1.0));
+            if let Some(label) = &ws_chip {
+                let bw = ((label.chars().count() + 2) as f32 * m.width).min(ww / 3.0).floor();
+                let ty = bar_y + ((tb_h - m.height) / 2.0).round();
+                win.renderer.rect(0.0, bar_y, bw, tb_h, rgba(theme.active_border, 1.0));
+                win.renderer.text(gpu, fonts, label, m.width, ty, bw - m.width, rgba(theme.tab_bar_bg, 1.0));
+                win.ws_btn = Some(Rect { x: 0.0, y: bar_y, w: bw, h: tb_h });
+                tabs_x = bw + 1.0;
+            }
             // "≡ 3 stashed" button at the right end (opens the stash browser)
             let mut tabs_w = ww;
             if stash_count > 0 {
@@ -2702,11 +2829,11 @@ impl App {
                 win.stash_btn = Some(Rect { x: bx, y: bar_y, w: bw, h: tb_h });
                 tabs_w = bx - 1.0;
             }
-            let ww = tabs_w;
+            let ww = tabs_w - tabs_x;
             let n = win.tabs.len().max(1) as f32;
             let tw = if cfg.tab_bar_expand { (ww / n).floor() } else { (ww / n).min(m.width * 32.0).floor() };
             for (i, title) in titles.iter().enumerate() {
-                let x = i as f32 * tw;
+                let x = tabs_x + i as f32 * tw;
                 let (fg, bg) = if i == active_tab {
                     (theme.tab_active_fg, theme.tab_active_bg)
                 } else {
@@ -2720,14 +2847,17 @@ impl App {
         } else if win.rename.is_some() {
             // Rename prompt without a tab bar: draw an overlay line on top
             win.renderer.rect(0.0, 0.0, ww, m.height + 4.0, rgba(theme.tab_active_bg, 1.0));
-            if let Some(t) = titles.get(active_tab) {
-                win.renderer.text(gpu, fonts, &format!("Tab title: {t}"), m.width, 2.0, ww, rgba(theme.tab_active_fg, 1.0));
-            }
+            let line = if win.rename_ws {
+                format!("Workspace name: {}▏", win.rename.as_deref().unwrap_or(""))
+            } else {
+                format!("Tab title: {}", titles.get(active_tab).cloned().unwrap_or_default())
+            };
+            win.renderer.text(gpu, fonts, &line, m.width, 2.0, ww, rgba(theme.tab_active_fg, 1.0));
         }
         // Window title
         if let Some(t) = titles.get(active_tab) {
             let t = t.split_once(": ").map(|x| x.1).unwrap_or(t).to_string();
-            let title = format!("{t} — dtem");
+            let title = match &ws_title { Some(w) => format!("{t} — {w} — dtem"), None => format!("{t} — dtem") };
             if title != win.last_title {
                 win.window.set_title(&title);
                 win.last_title = title;
@@ -3147,6 +3277,11 @@ enum MenuCmd {
     CopyLink(String),
     OpenLink(String),
     Shortcuts,
+    /// switch to workspace i
+    Workspace(usize),
+    CloseWorkspace(usize),
+    /// move the active tab to workspace i (None = a new workspace)
+    MoveTab(Option<usize>),
 }
 
 /// One row of the right-click menu; `cmd == None` is a separator.
@@ -4049,6 +4184,16 @@ impl App {
         items.push(item("Stash Tab", "stash_tab"));
         let n = self.stash_count;
         items.push(item(&if n > 0 { format!("Stashed Tabs ({n})…") } else { "Stashed Tabs…".to_string() }, "stashed_tabs"));
+        if let Some(win) = self.windows.get(&wid) {
+            for i in (0..win.workspaces.len()).filter(|i| *i != win.ws_cur) {
+                items.push(MenuItem {
+                    label: format!("Move Tab to “{}”", win.workspaces[i].name),
+                    hint: String::new(),
+                    cmd: Some(MenuCmd::MoveTab(Some(i))),
+                });
+            }
+        }
+        items.push(MenuItem { label: "Move Tab to New Workspace".into(), hint: String::new(), cmd: Some(MenuCmd::MoveTab(None)) });
         items.push(sep());
         items.push(item("Copy", "copy_to_clipboard"));
         items.push(item("Paste", "paste_from_clipboard"));
@@ -4070,7 +4215,11 @@ impl App {
         items.push(MenuItem { label: "Keyboard Shortcuts…".into(), hint: String::new(), cmd: Some(MenuCmd::Shortcuts) });
         items.push(sep());
         items.push(item("Quit", "quit"));
+        self.show_menu(wid, x, y, items);
+    }
 
+    /// Open a popup menu at (x, y), kept inside the window.
+    fn show_menu(&mut self, wid: WindowId, x: f32, y: f32, items: Vec<MenuItem>) {
         let Some(win) = self.windows.get_mut(&wid) else { return };
         let m = win.renderer.metrics;
         let (ww, wh) = win.renderer.size();
@@ -4099,6 +4248,20 @@ impl App {
             MenuCmd::CopyLink(u) => self.clip_set(false, u),
             MenuCmd::OpenLink(u) => self.open_url(&u),
             MenuCmd::Shortcuts => self.open_settings_tab(el, wid, Some("keys")),
+            MenuCmd::Workspace(i) => self.switch_workspace(wid, i),
+            MenuCmd::CloseWorkspace(i) => {
+                let n = self.windows.get(&wid).map(|w| w.ws_tabs(i).len()).unwrap_or(0);
+                if n == 0 {
+                    self.close_workspace(el, wid, i);
+                } else {
+                    self.request_close(el, wid, Confirm::Workspace(i));
+                }
+            }
+            MenuCmd::MoveTab(to) => {
+                if let Some(i) = self.windows.get(&wid).map(|w| w.active_tab) {
+                    self.move_tab_to_workspace(wid, i, to);
+                }
+            }
         }
     }
 
