@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 description = "GPU accelerated terminal with dropdown mode, splits, session restore and ssh clipboard sync"
 authors = ["Mehmet Yapar <mehmetyapar@windowslive.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/myprgit/dtem"
 
 [package.metadata.deb]
 section = "x11"

@@ -1,27 +1,119 @@
 # dtem
 
-GPU-accelerated terminal emulator. It runs as a normal window or as a dropdown, and keeps its whole session across restarts and reboots.
+**A GPU-accelerated terminal for Linux that never loses your work.** Use it as a normal window or as a dropdown terminal bound to a hotkey. Tabs, splits, scrollback and working directories survive restarts and reboots.
 
-- Renders through **wgpu** (Vulkan/GL). Terminal emulation comes from `alacritty_terminal`.
-- Supports tabs and split panes (a split tree like kitty's "splits" layout).
-- **Session persistence**, saved automatically every 5 s, on exit and on SIGTERM/SIGHUP:
-  - all windows and tabs come back
-  - each pane reopens in its last **cwd**
-  - **scrollback** is restored, including the primary screen behind vim/htop
-  - **split layout** and ratios, plus window size, position and monitor
-  - running programs are **not** restarted: a pane that was in nvim comes back as a shell in the same directory
-- Dropdown mode is a separate process with its own session. It remembers **the monitor you last moved it to**.
-- Ships kitty-like shortcuts, all of them configurable.
-- Asks for confirmation before closing a tab, pane or window. You can turn this off in the config.
-- **Text rendering:** programming **ligatures** (via swash shaping) and **color emoji**.
+![dtem with tabs, split panes, ligatures and tab activity markers](docs/screenshots/hero.png)
+
+- **Fast:** renders through wgpu (Vulkan/GL) on top of `alacritty_terminal`.
+- **Tabs and split panes:** a kitty-style split tree. Drag tabs to reorder them.
+- **Session persistence:** windows, tabs, splits, cwd and scrollback are restored, even after a reboot.
+- **Dropdown mode:** tilda/guake-style, remembers its monitor, and can import your tilda config.
+- **Shell integration:** prompt jumping, fuzzy history search across tabs, and autosuggestions.
+- **Kitty-compatible:** keyboard protocol, graphics protocol, OSC 8 hyperlinks and OSC 52 clipboard.
+- **`dtem --remote`:** SSH with clipboard, image and file sync, so you can paste a screenshot into a remote Claude Code.
+- **Single binary:** no runtime dependencies on x86_64 or arm64 Linux with glibc ≥ 2.30. Fonts and ble.sh are built in.
+
+## Feature tour
+
+### Tabs, splits and activity markers
+
+Tabs and split panes are shown in the screenshot above. `kitty_mod+enter` splits along the longer side, and `F5`/`F6` split horizontally/vertically. You can resize, move and zoom panes from the keyboard.
+
+To reorder tabs, **drag them** in the tab bar or use `kitty_mod+.`/`kitty_mod+,`.
+
+Tabs you aren't looking at get a marker:
+- **●** new output
+- **🔔** a bell, for example an agent waiting for input
+- **✗** a command failed
+
+Long-running commands that finish in the background send a desktop notification. Click it to jump to the tab.
+
+### Session persistence
+
+The session is saved every 5 s, on exit and on SIGTERM/SIGHUP. On the next start you get back:
+- every window and tab,
+- the split layout and ratios,
+- each pane's working directory,
+- the **scrollback**, including the primary screen behind vim or htop,
+- window size, position and monitor.
+
+Running programs are not restarted: a pane that was running nvim comes back as a shell in the same directory. SSH tabs remember the remote directory and ask before reconnecting.
+
+### Keyboard hints
+
+`kitty_mod+e` puts a letter on every URL, path, IP address, git hash and e-mail address on screen. Press the letter to open or copy the item, or Shift+letter to type it into the terminal.
+
+![Keyboard hints over links, paths, hashes and IPs](docs/screenshots/hints.png)
+
+### Fuzzy history search and autosuggestions
+
+**Ctrl+R** at a shell prompt opens dtem's own fuzzy history search over **all tabs**. Press Ctrl+R again to search only **this tab**. Enter puts the command on the prompt without running it. When vim, less, ssh or another program is in the foreground, Ctrl+R goes to that program instead.
+
+Every tab keeps its own command history across restarts.
+
+![Ctrl+R history search across all tabs](docs/screenshots/history.png)
+
+With bash, the bundled [ble.sh](https://github.com/akinomyoga/ble.sh) adds suggestions from your history as you type (→ accepts) and syntax highlighting:
+
+![ble.sh autosuggestion](docs/screenshots/suggest.png)
+
+### Search in scrollback
+
+`kitty_mod+f` searches the scrollback and highlights every match.
+
+![Scrollback search](docs/screenshots/search.png)
+
+### Images, ligatures and emoji
+
+dtem implements the **kitty graphics protocol**. Images scroll with the text and stay in the scrollback. Use them with:
+- `dtem --icat file.png`,
+- `dtem-icat` on remote hosts,
+- yazi, chafa, timg and other tools that support the protocol.
+
+Text rendering supports programming **ligatures** (swash shaping) and **color emoji**.
+
+![Inline image, ligatures and color emoji](docs/screenshots/images.png)
+
+### Right-click menu
+
+Right-clicking a terminal or the tab bar opens a menu with New Tab, Close Tab, Copy, Paste, Open/Copy Link, splits, fullscreen, transparency, search, Preferences…, Keyboard Shortcuts… and Quit. Each item shows its current shortcut. If a program uses the mouse (vim, htop), open the menu with **Shift+right-click**.
+
+![Right-click menu on a link](docs/screenshots/menu.png)
+
+### Settings page and shortcut editor
+
+Open the settings page with `ctrl+,`, `kitty_mod+F2`, right-click → Preferences…, or `dtem --settings`.
+
+- All options are grouped there: appearance, colors, dropdown, notifications, behavior, shell & titles and session.
+- Changes are written to `dtem.toml` with your comments preserved. Running instances apply them live.
+
+![Settings page](docs/screenshots/settings.png)
+
+The **Keys** section is a shortcut editor. Open it with right-click → Keyboard Shortcuts… or `dtem --settings=keys`.
+
+| Key | Action |
+|---|---|
+| Enter | select an action, then press the new key combination |
+| `a` | add a second combination |
+| `e` | type the combination as text |
+| `x` | unbind the action |
+| `r` | restore the default |
+
+If a combination is already used by another action, it is moved to the new one and the editor tells you. Key bindings fall back to the physical key position, so they also work on non-US layouts such as Turkish Q and F.
+
+![Shortcut editor](docs/screenshots/keys.png)
+
+### More
+
 - **Links:** Ctrl+click opens URLs and OSC 8 hyperlinks. They are underlined while Ctrl is held.
-- **Input:** **IME** support (ibus/fcitx) and the **kitty keyboard protocol**, which nvim and similar apps can turn on.
+- **Input:** IME support (ibus/fcitx) and the kitty keyboard protocol, which nvim and similar apps can turn on.
 - **Transparency:** background opacity is configurable (needs a compositor).
-- **`dtem --remote`:** SSH with clipboard and file sync (see below).
+- **Close confirmations:** dtem asks before closing a tab, pane or window. You can turn this off.
+- **Multiple dropdowns:** each has its own hotkey, tabs and session.
 
-## Install on any PC
+## Install
 
-dtem is a single self-contained binary. JetBrains Mono, ble.sh, the shell integration and the notification client are all built in. It runs on any x86_64 or arm64 Linux desktop with glibc ≥ 2.30 (Ubuntu 20.04+, Debian 11+, Fedora 32+, …). Neither Rust nor this repository is needed on the target machine.
+Download the binary or the .deb from the [Releases page](https://github.com/myprgit/dtem/releases). dtem is a single self-contained binary. JetBrains Mono, ble.sh, the shell integration and the notification client are all built in. It runs on any x86_64 or arm64 Linux desktop with glibc ≥ 2.30 (Ubuntu 20.04+, Debian 11+, Fedora 32+, …). Neither Rust nor this repository is needed on the target machine.
 
 ```bash
 # single binary
@@ -46,9 +138,21 @@ dtem --export-config            # → dtem-config.tar.gz (dtem.toml, saved layou
 dtem --import-config dtem-config.tar.gz   # on the other PC (old config is backed up)
 ```
 
-To build the artifacts yourself, run `scripts/build-dist.sh`. It writes `dist/` with both binaries, both .deb packages and SHA256SUMS. It needs cargo-zigbuild, zig and cargo-deb.
+### Build from source
 
-Ctrl+R (at a shell prompt) opens dtem's fuzzy history search over **all tabs**; press Ctrl+R again to search **this tab only**. Enter puts the command on the prompt without running it. When vim, less, ssh or another program is in the foreground, Ctrl+R goes to that program.
+You need a recent stable Rust toolchain (edition 2024, Rust ≥ 1.85).
+
+```bash
+cargo build --release
+./target/release/dtem --install     # or simply: ./install.sh
+```
+
+To build the release artifacts, run `scripts/build-dist.sh`. It writes `dist/` with:
+- portable binaries for x86_64 and aarch64 (glibc ≥ 2.30),
+- both .deb packages,
+- `SHA256SUMS`.
+
+It needs cargo-zigbuild, zig and cargo-deb.
 
 ## Coming from tilda
 
@@ -78,17 +182,9 @@ bash, zsh and fish are started with a small integration script. Your own `.bashr
 | long-running command notifications | see above |
 | ssh tabs | the remote directory is remembered; after a restart, reconnecting opens there |
 | separate history | every tab has its own command history (Up arrow), kept across restarts; new tabs start from `~/.bash_history` (`separate_history`) |
-| suggestions while typing | bash: install [ble.sh](https://github.com/akinomyoga/ble.sh) into `~/.local/share/blesh` and dtem loads it (dim suggestion, → accepts, Tab shows candidates, syntax colors); `autosuggestions = false` turns it off |
+| suggestions while typing | bash: the bundled [ble.sh](https://github.com/akinomyoga/ble.sh) is unpacked to `~/.local/share/dtem/blesh` on first use; a ble.sh you installed yourself in `~/.local/share/blesh` takes precedence (dim suggestion, → accepts, Tab shows candidates, syntax colors); `autosuggestions = false` turns it off |
 
 On hosts opened with `dtem --remote`, the integration, `dtem-copy` and `dtem-icat` are installed into `~/.local` automatically.
-
-## Keyboard hints
-
-`kitty_mod+e` puts letters on every link, path, IP address, git hash and e-mail address on the screen. Press a letter to open the link (or copy anything else). Press Shift+letter to type the item into the terminal instead.
-
-## Images
-
-dtem implements the kitty graphics protocol, so images work with `dtem --icat file.png`, with `dtem-icat` on remote hosts, and with tools that support the protocol (yazi, chafa, timg, …). Images scroll with the text and stay in the scrollback.
 
 ## Second dropdown
 
@@ -100,14 +196,6 @@ color_scheme = "dracula"
 ```
 
 Each dropdown has its own tabs, session, monitor memory and settings; they appear on the settings page as **Dropdown** and **Dropdown 2**. `dtem --toggle=2` toggles it, and `dtem --install-gnome-shortcut` registers the hotkeys of all dropdowns.
-
-## Right-click menu
-
-Right-click on a terminal (or the tab bar) opens a menu like tilda's: New Tab, Close Tab, Copy, Paste, Open/Copy Link (when clicking a link), splits, Toggle Fullscreen / Transparency / Searchbar, Preferences…, Keyboard Shortcuts…, and Quit. Each item shows its current shortcut. If a program uses the mouse (vim, htop), use **Shift+right-click**.
-
-## Settings page
-
-Open it with `ctrl+,` or `kitty_mod+F2`, or with right-click → Preferences… (it opens in a new tab). You can also run `dtem --settings`. The **Keys** section is the shortcut editor (right-click → Keyboard Shortcuts…, or `dtem --settings=keys`): select an action and press Enter, then press the new key combination. `a` adds a second combination, `e` lets you type combinations, `x` unbinds the action and `r` restores its default. If a combination is already used by another action, it is moved to the new one and the editor reports this. All options are grouped there: appearance, colors, dropdown, behavior, shell & titles, session and key bindings. Changes are saved to `dtem.toml` with comments preserved, and running instances apply them live (config hot-reload).
 
 ## Usage
 
@@ -122,9 +210,8 @@ dtem --install-gnome-shortcut register the dropdown hotkey in GNOME
 dtem --quit [--dropdown] [--no-save]  quit (--no-save: forget the session)
 dtem --settings               settings page
 dtem --import-tilda [FILE]    import a tilda config
+dtem --icat FILE              show an image in the terminal
 ```
-
-Install: `./install.sh --shortcut`
 
 ## Remote (SSH) and clipboard sync
 
@@ -171,7 +258,7 @@ Typed inside a dtem terminal, it runs ssh **right in that pane** (like `kitten s
 | new tab (inherits cwd) / close tab | `kitty_mod+t` / `kitty_mod+q` |
 | next / previous tab | `kitty_mod+→` `ctrl+tab` / `kitty_mod+←` `ctrl+shift+tab` |
 | go to tab N | `alt+1..9` |
-| move tab | `kitty_mod+.` / `kitty_mod+,` |
+| move tab | `kitty_mod+.` / `kitty_mod+,`, or drag it in the tab bar |
 | rename tab | `kitty_mod+alt+t` |
 | new split (along the longer side) | `kitty_mod+enter` |
 | hsplit / vsplit / rotate split | `F5` / `F6` / `F7` |
@@ -217,3 +304,14 @@ These are plain JSON, in the same format as the autosave. Example:
 Files:
 - config: `~/.config/dtem/dtem.toml` (see `dtem.example.toml`)
 - state: `~/.local/state/dtem/`
+
+## Third-party components
+
+- [alacritty_terminal](https://github.com/alacritty/alacritty) handles terminal emulation (Apache-2.0).
+- [JetBrains Mono](https://www.jetbrains.com/lp/mono/) is bundled as the built-in font (SIL OFL 1.1, see `assets/fonts/JetBrainsMono-OFL.txt`).
+- [ble.sh](https://github.com/akinomyoga/ble.sh) is bundled for bash autosuggestions (BSD-3-Clause, see `packaging/blesh-LICENSE.md`).
+
+## License
+
+dtem is licensed under the [Apache License 2.0](LICENSE). You may use, modify and redistribute it, commercially too. Redistributions must keep the copyright notice, the license and the [NOTICE](NOTICE) file, and modified files must say that they were changed. The license grants no right to use the dtem name to suggest endorsement (section 6).
+

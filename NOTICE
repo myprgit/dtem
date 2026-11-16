@@ -1,0 +1,10 @@
+dtem
+Copyright 2026 Mehmet Yapar
+
+This product is developed by Mehmet Yapar (https://github.com/myprgit/dtem).
+Redistributions and derivative works must retain this NOTICE, as required by
+section 4(d) of the Apache License, Version 2.0.
+
+Bundled third-party components:
+- JetBrains Mono, SIL Open Font License 1.1 (assets/fonts/JetBrainsMono-OFL.txt)
+- ble.sh, BSD-3-Clause (packaging/blesh-LICENSE.md)
