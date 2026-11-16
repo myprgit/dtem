@@ -302,6 +302,15 @@ impl Pane {
         t
     }
 
+    /// Name of the program in the foreground (e.g. "nvim"), if it isn't the shell itself.
+    pub fn foreground_name(&self) -> Option<String> {
+        let pg = unsafe { libc::tcgetpgrp(self.pty_fd) };
+        if pg <= 0 || pg as u32 == self.pid {
+            return None;
+        }
+        std::fs::read_to_string(format!("/proc/{pg}/comm")).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    }
+
     /// Name of the foreground process (e.g. "nvim"), if any other than the shell.
     pub fn display_title(&mut self) -> String {
         if !self.title.is_empty() {

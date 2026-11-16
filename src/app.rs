@@ -1,5 +1,6 @@
 //! Application: OS windows, tabs, split panes, input, rendering, dropdown & session handling.
 mod extras;
+mod stash;
 use extras::{hint_regexes, HintKind, Hints, HistSearch};
 use crate::config::{Config, Rgb, Theme};
 use crate::font::{self, FontSet};
@@ -57,6 +58,8 @@ enum Confirm {
     QuitNoSave,
     /// The shell of this pane exited by itself
     Exited(u64),
+    /// Stash a tab in which a program is running (it will end)
+    Stash(usize),
 }
 
 struct Tab {
@@ -90,6 +93,12 @@ struct OsWin {
     scroll_drag: Option<u64>,
     /// Index of the tab being dragged in the tab bar (left button held)
     tab_drag: Option<usize>,
+    /// Last left click on a tab (double-click renames)
+    tab_last_click: Option<(Instant, usize)>,
+    /// Stash browser overlay
+    stash: Option<stash::StashView>,
+    /// Stash button at the end of the tab bar
+    stash_btn: Option<Rect>,
     bell_at: Option<Instant>,
     menu: Option<Menu>,
     hints: Option<Hints>,
@@ -167,6 +176,9 @@ pub struct App {
     /// touchpad ctrl+scroll accumulator (pixels)
     zoom_acc: f64,
     last_wheel: Option<(Instant, bool)>,
+    /// Number of stashed tabs (shared by all instances; refreshed on focus)
+    stash_count: usize,
+    stash_last_click: Option<(Instant, usize)>,
     exiting: bool,
 }
 
@@ -216,6 +228,8 @@ impl App {
 
             zoom_acc: 0.0,
             last_wheel: None,
+            stash_count: stash::count(),
+            stash_last_click: None,
             cfg,
             role,
             proxy,
@@ -423,6 +437,9 @@ impl App {
                 search: None,
                 scroll_drag: None,
                 tab_drag: None,
+                tab_last_click: None,
+                stash: None,
+                stash_btn: None,
                 bell_at: None,
                 menu: None,
                 hints: None,
@@ -770,7 +787,7 @@ impl App {
             Confirm::Tab(_) => cc.tab,
             Confirm::Pane(_) => cc.pane,
             Confirm::Window | Confirm::Quit | Confirm::QuitNoSave => cc.window,
-            Confirm::ClipRead(_) | Confirm::Exited(_) => true,
+            Confirm::ClipRead(_) | Confirm::Exited(_) | Confirm::Stash(_) => true,
         };
         if !ask {
             self.execute_close(el, wid, c);
@@ -786,6 +803,7 @@ impl App {
     fn execute_close(&mut self, el: &ActiveEventLoop, wid: WindowId, c: Confirm) {
         match c {
             Confirm::Tab(i) => self.close_tab(el, wid, i),
+            Confirm::Stash(i) => self.stash_tab(el, wid, i),
             Confirm::Pane(id) => self.close_pane(el, id),
             Confirm::ClipRead(id) => {
                 if let Some(f) = self.pending_clip.remove(&wid) {
@@ -858,6 +876,20 @@ impl App {
                 }
             }
             Confirm::Pane(_) => "Close this pane?".to_string(),
+            Confirm::Stash(i) => {
+                let progs: Vec<String> = win
+                    .tabs
+                    .get(i)
+                    .map(|t| t.root.leaf_list())
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|id| self.panes.get(id))
+                    .filter(|p| p.remote.is_none() && !p.shell_idle())
+                    .filter_map(|p| p.foreground_name())
+                    .collect();
+                let what = if progs.is_empty() { "A program is running".to_string() } else { format!("{} is running", progs.join(", ")) };
+                format!("{what} in this tab and will end. Stash it anyway?")
+            }
             Confirm::ClipRead(id) => {
                 let who = self.panes.get(&id).and_then(|p| p.remote.as_ref().map(|r| r.label())).unwrap_or("A program".into());
                 format!("{who} wants to read your clipboard.")
@@ -1190,6 +1222,8 @@ impl App {
         let Ok(rd) = std::fs::read_dir(&dir) else { return };
         // ids referenced by any saved session (other dropdowns/windows too)
         let mut used: Vec<String> = self.panes.values().map(|p| p.persist_id.clone()).collect();
+        // stashed tabs keep their history until they are restored or deleted
+        used.extend(stash::referenced_ids());
         if let Ok(sd) = std::fs::read_dir(crate::config::state_dir()) {
             for e in sd.flatten() {
                 let n = e.file_name().to_string_lossy().to_string();
@@ -1543,6 +1577,23 @@ impl App {
             Action::OpenSettings => self.open_settings_tab(el, wid, None),
             Action::Hints => self.start_hints(wid),
             Action::HistorySearch => self.open_history_search(wid),
+            Action::StashTab => {
+                if let Some(i) = self.windows.get(&wid).map(|w| w.active_tab) {
+                    // running programs end when stashed (like on restart): ask first
+                    let busy = self.windows[&wid].tabs[i]
+                        .root
+                        .leaf_list()
+                        .iter()
+                        .filter_map(|id| self.panes.get(id))
+                        .any(|p| p.remote.is_none() && !p.settings && !p.shell_idle());
+                    if busy {
+                        self.request_close(el, wid, Confirm::Stash(i));
+                    } else {
+                        self.stash_tab(el, wid, i);
+                    }
+                }
+            }
+            Action::StashedTabs => self.open_stash_view(wid),
             Action::PromptPrev => self.jump_prompt(wid, false),
             Action::PromptNext => self.jump_prompt(wid, true),
             Action::CopyLastOutput => self.copy_last_output(wid),
@@ -1663,6 +1714,9 @@ impl App {
             return;
         }
         if self.windows.get(&wid).map(|w| w.hist.is_some()).unwrap_or(false) && self.history_key(wid, &ev) {
+            return;
+        }
+        if self.windows.get(&wid).map(|w| w.stash.is_some()).unwrap_or(false) && self.stash_key(wid, &ev) {
             return;
         }
         // Close confirmation prompt
@@ -1842,6 +1896,19 @@ impl App {
             self.menu_mouse(el, wid, pressed, button);
             return;
         }
+        if self.windows[&wid].stash.is_some() {
+            if pressed && button == MouseButton::Left {
+                self.stash_click(wid, x as f32, y as f32);
+            }
+            return;
+        }
+        // Stash button at the end of the tab bar
+        if pressed && button == MouseButton::Left {
+            if self.windows[&wid].stash_btn.map(|r| r.contains(x as f32, y as f32)).unwrap_or(false) {
+                self.open_stash_view(wid);
+                return;
+            }
+        }
         // Right click: context menu (shift+right click always, even if the app uses the mouse)
         if pressed && button == MouseButton::Right {
             if let Some((id, rect)) = self.pane_at(wid, x, y) {
@@ -1853,7 +1920,10 @@ impl App {
                     self.open_menu(wid, x as f32, y as f32, url);
                     return;
                 }
-            } else if self.windows[&wid].tab_rects.iter().any(|(_, r)| r.contains(x as f32, y as f32)) {
+            } else if let Some(i) = self.windows[&wid].tab_rects.iter().find(|(_, r)| r.contains(x as f32, y as f32)).map(|t| t.0) {
+                // the menu's tab items act on the tab that was right-clicked
+                self.windows.get_mut(&wid).unwrap().active_tab = i;
+                self.relayout(wid);
                 self.open_menu(wid, x as f32, y as f32, None);
                 return;
             }
@@ -1867,10 +1937,16 @@ impl App {
             if let Some(i) = hit {
                 match button {
                     MouseButton::Left => {
+                        let now = Instant::now();
                         let win = self.windows.get_mut(&wid).unwrap();
+                        let double = matches!(win.tab_last_click, Some((t, j)) if j == i && now - t < Duration::from_millis(400));
+                        win.tab_last_click = if double { None } else { Some((now, i)) };
                         win.active_tab = i;
-                        win.tab_drag = Some(i);
+                        win.tab_drag = (!double).then_some(i);
                         self.relayout(wid);
+                        if double {
+                            self.do_action(el, wid, Action::SetTabTitle);
+                        }
                     }
                     MouseButton::Middle => self.request_close(el, wid, Confirm::Tab(i)),
                     _ => {}
@@ -2084,6 +2160,15 @@ impl App {
     }
 
     fn on_wheel(&mut self, wid: WindowId, delta: MouseScrollDelta) {
+        if self.windows.get(&wid).map(|w| w.stash.is_some()).unwrap_or(false) {
+            // wheel moves the selection in the stash browser
+            let up = match delta {
+                MouseScrollDelta::LineDelta(_, y) => y > 0.0,
+                MouseScrollDelta::PixelDelta(p) => p.y > 0.0,
+            };
+            self.stash_scroll(wid, up);
+            return;
+        }
         // Some X setups deliver a wheel click twice (XI2 valuator + legacy button): drop
         // a same-direction line event arriving within 15 ms.
         if let MouseScrollDelta::LineDelta(_, y) = delta {
@@ -2157,6 +2242,7 @@ impl App {
         let last_input = self.last_input;
         let tab_bar_h = self.windows.get(&wid).map(|w| self.tab_bar_height(w)).unwrap_or(0.0);
         let tb_h_pre = tab_bar_h;
+        let stash_count = self.stash_count;
         let confirm_text = self.windows.get(&wid).and_then(|w| w.confirm).map(|c| {
             let hint = if matches!(c, Confirm::ClipRead(_)) {
                 "[y] allow once   [a] always   [n] deny"
@@ -2450,6 +2536,91 @@ impl App {
             r.text(gpu, fonts, &q, m.width, list_bottom, ww, rgba(theme.table[256], 1.0));
         }
 
+        // Stash browser
+        if let Some(v) = &win.stash {
+            let size = win.renderer.size();
+            let (_, wh) = size;
+            let g = stash::stash_geometry(size, m, tab_bar_h, cfg);
+            let bottom = if cfg.tab_bar_position == "bottom" { wh - tab_bar_h } else { wh };
+            let r = &mut win.renderer;
+            let dim = rgba(theme.inactive_border, 1.0);
+            let fg = rgba(theme.table[256], 1.0);
+            r.rect_top(0.0, g.top, ww, bottom - g.top, rgba(theme.tab_bar_bg, 1.0));
+            let head = format!(
+                " Stashed tabs ({})   Enter / double-click: restore   d: delete   Esc: close",
+                v.entries.len()
+            );
+            r.text(gpu, fonts, &head, 0.0, g.top + 4.0, ww, dim);
+            r.rect_top(0.0, g.list_y - 5.0, ww, 1.0, rgba(theme.active_border, 1.0));
+            if v.entries.is_empty() {
+                let key = keys::effective_combos(cfg, "stash_tab").first().map(|c| pretty_combo(c)).unwrap_or_default();
+                let msg = if key.is_empty() {
+                    "No stashed tabs. Right-click a tab → Stash Tab puts it away.".to_string()
+                } else {
+                    format!("No stashed tabs. {key} (or right-click → Stash Tab) puts the current tab away.")
+                };
+                r.text(gpu, fonts, &msg, m.width * 2.0, g.list_y + m.height, ww, fg);
+            } else {
+                let start = g.first_row(v.sel);
+                for (k, e) in v.entries.iter().enumerate().skip(start).take(g.rows) {
+                    let y = g.list_y + (k - start) as f32 * g.row_h;
+                    let selected = k == v.sel;
+                    if selected {
+                        r.rect_top(0.0, y, g.list_w, g.row_h - 2.0, rgba(theme.sel_bg, 1.0));
+                    }
+                    let (c1, c2) = if selected { (rgba(theme.sel_fg, 1.0), rgba(theme.sel_fg, 0.75)) } else { (fg, dim) };
+                    let title = if e.title.is_empty() { "(untitled)" } else { e.title.as_str() };
+                    r.text(gpu, fonts, &format!("{} {title}", if selected { "▶" } else { " " }), m.width * 0.5, y + 2.0, g.list_w - m.width, c1);
+                    let mut info = Vec::new();
+                    if let Some(c) = &e.cwd {
+                        info.push(stash::tilde(c));
+                    }
+                    if e.panes > 1 {
+                        info.push(format!("{} panes", e.panes));
+                    }
+                    info.push(stash::ago(e.stashed_at));
+                    r.text(gpu, fonts, &info.join(" · "), m.width * 2.5, y + 2.0 + m.height, g.list_w - m.width * 3.0, c2);
+                }
+                // preview of the selected tab's focused pane (newest lines at the bottom)
+                r.rect_top(g.list_w, g.list_y - 4.0, 1.0, bottom - g.list_y + 4.0, rgba(theme.active_border, 1.0));
+                let x0 = g.list_w + m.width;
+                let rows = ((bottom - g.list_y - 4.0) / m.height).max(1.0) as usize;
+                // panes share the height; each shows its newest lines under a header
+                let n = v.preview.len().max(1);
+                let per = (rows / n).max(2);
+                let mut y = g.list_y;
+                for (i, (header, lines)) in v.preview.iter().enumerate() {
+                    let mut avail = if i + 1 == n { rows.saturating_sub(per * i) } else { per };
+                    if !header.is_empty() {
+                        if i > 0 {
+                            r.rect_top(g.list_w, y - 2.0, ww - g.list_w, 1.0, rgba(theme.inactive_border, 1.0));
+                        }
+                        r.text(gpu, fonts, header, x0, y, ww - x0, rgba(theme.active_border, 1.0));
+                        y += m.height;
+                        avail = avail.saturating_sub(1);
+                    }
+                    let first = lines.len().saturating_sub(avail);
+                    for l in &lines[first..] {
+                        r.text(gpu, fonts, l, x0, y, ww - x0, fg);
+                        y += m.height;
+                    }
+                    if lines.is_empty() {
+                        r.text(gpu, fonts, "(no saved output)", x0, y, ww - x0, dim);
+                    }
+                    y = g.list_y + (per * (i + 1)) as f32 * m.height;
+                }
+            }
+            if v.confirm_delete {
+                if let Some(e) = v.entries.get(v.sel) {
+                    let msg = format!(" Press d again to delete “{}” for good ", e.title);
+                    let w = (msg.chars().count() as f32 * m.width).min(ww);
+                    let y = bottom - m.height - 6.0;
+                    r.rect_top(0.0, y - 3.0, w, m.height + 6.0, rgba(theme.search_match, 1.0));
+                    r.text(gpu, fonts, &msg, 0.0, y, w, rgba(theme.table[257], 1.0));
+                }
+            }
+        }
+
         // Scrollbars
         if cfg.scrollbar != "none" {
             let sw = (4.0 * win.scale as f32).round().max(3.0);
@@ -2516,8 +2687,22 @@ impl App {
             let mark = markers.get(i).copied().unwrap_or("");
             titles.push(format!("{}: {mark}{}{}{}", i + 1, base, count, z));
         }
+        win.stash_btn = None;
         if tb_h > 0.0 {
             win.renderer.rect(0.0, bar_y, ww, tb_h, rgba(theme.tab_bar_bg, 1.0));
+            // "≡ 3 stashed" button at the right end (opens the stash browser)
+            let mut tabs_w = ww;
+            if stash_count > 0 {
+                let label = format!("≡ {stash_count} stashed");
+                let bw = ((label.chars().count() + 2) as f32 * m.width).min(ww / 3.0).floor();
+                let bx = ww - bw;
+                let ty = bar_y + ((tb_h - m.height) / 2.0).round();
+                win.renderer.rect(bx, bar_y, bw, tb_h, rgba(theme.tab_inactive_bg, 1.0));
+                win.renderer.text(gpu, fonts, &label, bx + m.width, ty, bw - m.width, rgba(theme.tab_inactive_fg, 1.0));
+                win.stash_btn = Some(Rect { x: bx, y: bar_y, w: bw, h: tb_h });
+                tabs_w = bx - 1.0;
+            }
+            let ww = tabs_w;
             let n = win.tabs.len().max(1) as f32;
             let tw = if cfg.tab_bar_expand { (ww / n).floor() } else { (ww / n).min(m.width * 32.0).floor() };
             for (i, title) in titles.iter().enumerate() {
@@ -3317,6 +3502,8 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Focused(f) => {
                 if f {
                     self.last_focused = Some(wid);
+                    // another instance may have stashed/restored tabs meanwhile
+                    self.stash_count = stash::count();
                 }
                 let win = self.windows.get_mut(&wid).unwrap();
                 win.focused = f;
@@ -3858,7 +4045,11 @@ impl App {
         let hint = |a: &str| keys::effective_combos(&self.cfg, a).first().map(|c| pretty_combo(c)).unwrap_or_default();
         let item = |label: &str, a: &'static str| MenuItem { label: label.into(), hint: hint(a), cmd: Some(MenuCmd::Action(a)) };
         let sep = || MenuItem { label: String::new(), hint: String::new(), cmd: None };
-        let mut items = vec![item("New Tab", "new_tab"), item("Close Tab", "close_tab"), sep()];
+        let mut items = vec![item("New Tab", "new_tab"), item("Rename Tab…", "set_tab_title"), item("Close Tab", "close_tab"), sep()];
+        items.push(item("Stash Tab", "stash_tab"));
+        let n = self.stash_count;
+        items.push(item(&if n > 0 { format!("Stashed Tabs ({n})…") } else { "Stashed Tabs…".to_string() }, "stashed_tabs"));
+        items.push(sep());
         items.push(item("Copy", "copy_to_clipboard"));
         items.push(item("Paste", "paste_from_clipboard"));
         if let Some(u) = url {

@@ -59,6 +59,8 @@ pub enum Action {
     PromptNext,
     CopyLastOutput,
     HistorySearch,
+    StashTab,
+    StashedTabs,
     None,
 }
 
@@ -129,6 +131,8 @@ impl Action {
             "scroll_to_prompt_down" | "next_prompt" => Action::PromptNext,
             "copy_last_command_output" | "copy_last_output" => Action::CopyLastOutput,
             "history_search" => Action::HistorySearch,
+            "stash_tab" => Action::StashTab,
+            "stashed_tabs" | "stash_browser" => Action::StashedTabs,
             "none" | "no_op" => Action::None,
             _ => return None,
         })
@@ -145,7 +149,10 @@ const DEFAULTS: &[(&str, &str)] = &[
     ("ctrl+shift+tab", "previous_tab"),
     ("kitty_mod+period", "move_tab_forward"),
     ("kitty_mod+comma", "move_tab_backward"),
+    ("kitty_mod+r", "set_tab_title"),
     ("kitty_mod+alt+t", "set_tab_title"),
+    ("kitty_mod+d", "stash_tab"),
+    ("kitty_mod+o", "stashed_tabs"),
     ("alt+1", "goto_tab_1"),
     ("alt+2", "goto_tab_2"),
     ("alt+3", "goto_tab_3"),
@@ -231,6 +238,8 @@ pub const ACTIONS: &[(&str, &str)] = &[
     ("move_tab_forward", "Move tab right"),
     ("move_tab_backward", "Move tab left"),
     ("set_tab_title", "Rename tab"),
+    ("stash_tab", "Stash tab"),
+    ("stashed_tabs", "Stashed tabs"),
     ("goto_tab_1", "Go to tab 1"),
     ("goto_tab_2", "Go to tab 2"),
     ("goto_tab_3", "Go to tab 3"),

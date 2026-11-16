@@ -6,6 +6,7 @@
 
 - **Fast:** renders through wgpu (Vulkan/GL) on top of `alacritty_terminal`.
 - **Tabs and split panes:** a kitty-style split tree. Drag tabs to reorder them.
+- **Tab stash:** put tabs away and bring them back later. Their output stays browsable in the meantime.
 - **Session persistence:** windows, tabs, splits, cwd and scrollback are restored, even after a reboot.
 - **Dropdown mode:** tilda/guake-style, remembers its monitor, and can import your tilda config.
 - **Shell integration:** prompt jumping, fuzzy history search across tabs, and autosuggestions.
@@ -27,6 +28,32 @@ Tabs you aren't looking at get a marker:
 - **✗** a command failed
 
 Long-running commands that finish in the background send a desktop notification. Click it to jump to the tab.
+
+To rename a tab, **double-click** it, press `kitty_mod+r`, or right-click → Rename Tab….
+
+### Stash tabs
+
+Put a tab away with `kitty_mod+d` (or right-click → Stash Tab) and get it back later. A stashed tab keeps:
+- its split layout and working directories,
+- its scrollback,
+- its per-tab command history,
+- its title.
+
+`kitty_mod+o`, or the **≡ N stashed** button at the end of the tab bar, opens the stash browser. It shows every pane's output **without restoring the tab**.
+
+| In the browser | |
+|---|---|
+| ↑/↓ | select |
+| Enter or double-click | restore the tab |
+| `d` twice | delete it |
+| Esc | close the browser |
+
+Notes:
+- Like session restore, stashing ends running programs; restored panes come back as shells.
+- The stash is shared by all dtem windows and dropdowns, so you can stash a tab in the dropdown and restore it in a window.
+- Stashed tabs survive restarts.
+
+![Stash browser previewing a stashed two-pane tab](docs/screenshots/stash.png)
 
 ### Session persistence
 
@@ -76,7 +103,7 @@ Text rendering supports programming **ligatures** (swash shaping) and **color em
 
 ### Right-click menu
 
-Right-clicking a terminal or the tab bar opens a menu with New Tab, Close Tab, Copy, Paste, Open/Copy Link, splits, fullscreen, transparency, search, Preferences…, Keyboard Shortcuts… and Quit. Each item shows its current shortcut. If a program uses the mouse (vim, htop), open the menu with **Shift+right-click**.
+Right-clicking a terminal or the tab bar opens a menu with New Tab, Rename Tab…, Close Tab, Stash Tab, Stashed Tabs…, Copy, Paste, Open/Copy Link, splits, fullscreen, transparency, search, Preferences…, Keyboard Shortcuts… and Quit. Each item shows its current shortcut. If a program uses the mouse (vim, htop), open the menu with **Shift+right-click**.
 
 ![Right-click menu on a link](docs/screenshots/menu.png)
 
@@ -117,9 +144,9 @@ Download the binary or the .deb from the [Releases page](https://github.com/mypr
 
 ```bash
 # single binary
-chmod +x dtem-0.1.0-x86_64 && ./dtem-0.1.0-x86_64 --install
+chmod +x dtem-0.2.0-x86_64 && ./dtem-0.2.0-x86_64 --install
 # or the Debian/Ubuntu package
-sudo apt install ./dtem_0.1.0-1_amd64.deb && dtem --install
+sudo apt install ./dtem_0.2.0-1_amd64.deb && dtem --install
 ```
 
 `dtem --install` sets up the following for the current user:
@@ -259,7 +286,8 @@ Typed inside a dtem terminal, it runs ssh **right in that pane** (like `kitten s
 | next / previous tab | `kitty_mod+→` `ctrl+tab` / `kitty_mod+←` `ctrl+shift+tab` |
 | go to tab N | `alt+1..9` |
 | move tab | `kitty_mod+.` / `kitty_mod+,`, or drag it in the tab bar |
-| rename tab | `kitty_mod+alt+t` |
+| rename tab | `kitty_mod+r`, `kitty_mod+alt+t`, or double-click the tab |
+| stash tab / stashed tabs | `kitty_mod+d` / `kitty_mod+o` |
 | new split (along the longer side) | `kitty_mod+enter` |
 | hsplit / vsplit / rotate split | `F5` / `F6` / `F7` |
 | close pane | `kitty_mod+w` |
