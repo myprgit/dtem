@@ -88,6 +88,8 @@ struct OsWin {
     unfocused_at: Option<Instant>,
     search: Option<SearchState>,
     scroll_drag: Option<u64>,
+    /// Index of the tab being dragged in the tab bar (left button held)
+    tab_drag: Option<usize>,
     bell_at: Option<Instant>,
     menu: Option<Menu>,
     hints: Option<Hints>,
@@ -420,6 +422,7 @@ impl App {
                 unfocused_at: None,
                 search: None,
                 scroll_drag: None,
+                tab_drag: None,
                 bell_at: None,
                 menu: None,
                 hints: None,
@@ -1856,12 +1859,17 @@ impl App {
             }
         }
         // Tab bar
+        if !pressed && button == MouseButton::Left && self.windows.get_mut(&wid).unwrap().tab_drag.take().is_some() {
+            return;
+        }
         if pressed {
             let hit = self.windows[&wid].tab_rects.iter().find(|(_, r)| r.contains(x as f32, y as f32)).map(|x| x.0);
             if let Some(i) = hit {
                 match button {
                     MouseButton::Left => {
-                        self.windows.get_mut(&wid).unwrap().active_tab = i;
+                        let win = self.windows.get_mut(&wid).unwrap();
+                        win.active_tab = i;
+                        win.tab_drag = Some(i);
                         self.relayout(wid);
                     }
                     MouseButton::Middle => self.request_close(el, wid, Confirm::Tab(i)),
@@ -2009,6 +2017,10 @@ impl App {
             }
             return;
         }
+        if let Some(from) = self.windows[&wid].tab_drag {
+            self.drag_tab(wid, from, x as f32);
+            return;
+        }
         if let Some(id) = self.windows[&wid].scroll_drag {
             if let Some(r) = self.windows[&wid].pane_rects.iter().find(|(i, _)| *i == id).map(|x| x.1) {
                 self.scroll_to_y(wid, id, r, y);
@@ -2043,6 +2055,32 @@ impl App {
                 self.mouse_report(id, 3, true, true, col, row);
             }
         }
+    }
+
+    /// Move the dragged tab to the slot under the cursor's x (y is ignored, so the
+    /// drag keeps working when the pointer slips off the tab bar).
+    fn drag_tab(&mut self, wid: WindowId, from: usize, x: f32) {
+        let win = self.windows.get_mut(&wid).unwrap();
+        let (Some(first), Some(last)) = (win.tab_rects.first(), win.tab_rects.last()) else { return };
+        let to = if x < first.1.x {
+            first.0
+        } else if x >= last.1.x + last.1.w {
+            last.0
+        } else {
+            match win.tab_rects.iter().find(|(_, r)| x >= r.x && x < r.x + r.w) {
+                Some((i, _)) => *i,
+                None => return,
+            }
+        };
+        if to == from || from >= win.tabs.len() || to >= win.tabs.len() {
+            return;
+        }
+        let tab = win.tabs.remove(from);
+        win.tabs.insert(to, tab);
+        win.active_tab = to;
+        win.tab_drag = Some(to);
+        self.relayout(wid);
+        self.mark_save_soon();
     }
 
     fn on_wheel(&mut self, wid: WindowId, delta: MouseScrollDelta) {
